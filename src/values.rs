@@ -25,7 +25,7 @@ use sqlparser_expr_eval::{
 };
 use sqlparser_plpgsql::{
     embedded::{
-        self, Block, Case, Declaration, DeclarationKind, DeclaredType, LoopControl, NodeKind,
+        self, Block, Case, Declaration, DeclarationKind, DeclaredType, Loop, LoopControl, NodeKind,
     },
     namespace::{self, Name, NameKind, Signature, Sql},
 };
@@ -161,6 +161,15 @@ impl<'body, C: Context> Analysis<'body, C> {
     #[must_use]
     pub fn unmatched(&self, case: &'body Case) -> bool {
         self.flow.unmatched(case).is_some_and(|state| !state.is_impossible())
+    }
+
+    /// Whether control may leave `repeated` once a path enters it, `None`
+    /// when no path reaches it, as [`Flow::left`] tells where control
+    /// leaves a loop.
+    #[must_use]
+    pub fn ends(&self, repeated: &'body Loop) -> Option<bool> {
+        self.flow.entered(repeated).filter(|state| !state.is_impossible())?;
+        Some(self.flow.left(repeated).is_some_and(|state| !state.is_impossible()))
     }
 
     /// What `expression` evaluates to under the guarantees reaching `sql`,

@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod domain;
+mod raise;
 pub mod reaching;
 pub mod values;
 mod walk;
