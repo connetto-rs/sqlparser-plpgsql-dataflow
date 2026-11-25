@@ -632,6 +632,84 @@ fn an_expression_reads_what_the_context_holds_when_it_is_read() {
     assert_eq!(read.outcomes(), Outcomes::TRUE);
 }
 
+/// Integer columns `a`, never null, and `c`, nullable, with the columns
+/// named in it planned as constants, and every variable a non-raising
+/// integer.
+struct Columns(&'static [&'static str]);
+
+impl sqlparser_expr_eval::Context for Columns {
+    type Reference = &'static str;
+    type Error = Infallible;
+
+    fn reference(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Option<Resolved<&'static str>>, Infallible> {
+        let Expr::Identifier(identifier) = expression else { return Ok(None) };
+        let (reference, null) = match identifier.value.as_str() {
+            "a" => ("a", false),
+            "c" => ("c", true),
+            _ => return Ok(None),
+        };
+        let evaluation = Evaluation::unknown(INTEGER).with_null(null).with_error(false);
+        Ok(Some(Resolved { reference, evaluation }))
+    }
+
+    fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Infallible> {
+        Ok(Vec::new())
+    }
+
+    fn may_plan_as_constant(&self, reference: &&'static str) -> bool {
+        self.0.contains(reference)
+    }
+}
+
+impl values::Context for Columns {
+    fn variable(&mut self, _variable: &Name, _fields: &[String]) -> Result<Evaluation, Infallible> {
+        Ok(Evaluation::unknown(INTEGER).with_error(false))
+    }
+}
+
+#[test]
+fn a_strict_operator_beside_a_variable_may_fold_before_its_operand_raises() {
+    // PostgreSQL counts the row of `(a / 0 > y) IS NULL` for a `NULL` `y` its
+    // plan folds.
+    for (body, kind, parameters, compared) in [
+        ("BEGIN RETURN y; END", FunctionKind::Plain, &["y"][..], "a / 0 > y"),
+        (
+            "DECLARE r record; BEGIN SELECT 1 AS f INTO r; r.f := NULL; RETURN r.f; END",
+            FunctionKind::Plain,
+            &[],
+            "a / 0 > r.f",
+        ),
+        ("BEGIN RETURN NEW.c; END", FunctionKind::Trigger, &[], "a / 0 > NEW.c"),
+        ("BEGIN RETURN OLD.c; END", FunctionKind::Trigger, &[], "a / 0 > OLD.c"),
+    ] {
+        let block = embedded_sql(body).unwrap();
+        let signature = Signature {
+            name: "f".into(),
+            parameters: parameters.iter().map(|name| Some((*name).into())).collect(),
+            kind,
+        };
+        let mut analysis =
+            analyze(&block, &signature, Transactions::Refused, &mut Scalars, Columns(&[])).unwrap();
+        let site = Sql::Expression(returned(block.statements.last().unwrap()));
+        let read = analysis.truth_under(site, &parsed(compared)).unwrap().unwrap();
+        assert!(read.may_be_null() && !read.always_raises(), "{compared}");
+    }
+}
+
+#[test]
+fn a_strict_operator_beside_a_column_folds_only_where_the_context_plans_it() {
+    let block = embedded_sql("BEGIN RETURN 1; END").unwrap();
+    let site = Sql::Expression(returned(&block.statements[0]));
+    for (constants, always) in [(&[][..], true), (&["c"][..], false)] {
+        let mut analysis = analysis(&block, &[], Columns(constants));
+        let read = analysis.truth_under(site, &parsed("a / 0 > c")).unwrap().unwrap();
+        assert_eq!(read.always_raises(), always, "{constants:?}");
+    }
+}
+
 #[test]
 fn a_positional_parameter_reads_the_parameter_it_numbers() {
     // PostgreSQL answers `other` for 1, -1 and `NULL`.
