@@ -134,17 +134,17 @@ fn signature(parameters: &[&str]) -> Signature {
 }
 
 /// The walk over `block` with parameters `names`, read through `context`.
-fn analysis<'body, 'context, C: values::Context<Error = Infallible>>(
+fn analysis<'body, C: values::Context<Error = Infallible>>(
     block: &'body Block,
     names: &[&str],
-    context: &'context mut C,
-) -> Analysis<'body, 'context, C> {
+    context: C,
+) -> Analysis<'body, C> {
     analyze(block, &signature(names), Transactions::Refused, &mut Scalars, context).unwrap()
 }
 
 /// The outcomes `condition` may take where the body reaches it.
 fn outcomes<'body, C: values::Context<Error = Infallible>>(
-    analysis: &mut Analysis<'body, '_, C>,
+    analysis: &mut Analysis<'body, C>,
     condition: &'body Query,
 ) -> Outcomes {
     let evaluation = analysis.condition(condition).unwrap();
@@ -172,8 +172,7 @@ fn a_default_decides_a_later_condition() {
         "DECLARE x int := 5; BEGIN IF x > 0 THEN RETURN 'then'; ELSE RETURN 'else'; END IF; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     let condition = if_condition(&block.statements[0]);
     assert_eq!(outcomes(&mut analysis, condition), Outcomes::TRUE);
     let NodeKind::If(choice) = &block.statements[0].kind else { panic!("an IF") };
@@ -188,8 +187,7 @@ fn a_branch_narrows_the_conditions_inside_it() {
          RETURN 'other'; END",
     )
     .unwrap();
-    let mut context = Parameters(vec![INTEGER]);
-    let mut analysis = analysis(&block, &["n"], &mut context);
+    let mut analysis = analysis(&block, &["n"], Parameters(vec![INTEGER]));
     let NodeKind::If(outer) = &block.statements[0].kind else { panic!("an IF") };
     let inner = if_condition(&outer.branches[0].statements[0]);
     assert_eq!(outcomes(&mut analysis, inner), Outcomes::NULL);
@@ -207,8 +205,8 @@ fn a_case_without_else_reaches_its_end_unless_a_when_holds() {
                CASE p WHEN 'a' THEN RETURN 'first'; WHEN 'b' THEN RETURN 'second'; END CASE; END";
     for (body, index, unmatched) in [(open, 0, true), (set, 1, false)] {
         let block = embedded_sql(body).unwrap();
-        let mut context = Parameters(vec![ScalarType::Text(TextRules::DEFAULT)]);
-        let analysis = analysis(&block, &["p"], &mut context);
+        let analysis =
+            analysis(&block, &["p"], Parameters(vec![ScalarType::Text(TextRules::DEFAULT)]));
         let NodeKind::Case(case) = &block.statements[index].kind else { panic!("a CASE") };
         assert_eq!(analysis.unmatched(case), unmatched, "{body}");
         let first = Sql::Expression(returned(&case.branches[0].statements[0]));
@@ -224,8 +222,7 @@ fn a_when_listing_several_values_matches_any_of_them() {
          END CASE; END",
     )
     .unwrap();
-    let mut context = Parameters(vec![ScalarType::Text(TextRules::DEFAULT)]);
-    let analysis = analysis(&block, &["p"], &mut context);
+    let analysis = analysis(&block, &["p"], Parameters(vec![ScalarType::Text(TextRules::DEFAULT)]));
     let NodeKind::Case(case) = &block.statements[1].kind else { panic!("a CASE") };
     let otherwise = case.otherwise.as_ref().expect("an ELSE");
     assert!(analysis.reached(Sql::Expression(returned(&case.branches[0].statements[0]))));
@@ -240,8 +237,7 @@ fn a_handler_reads_the_values_written_before_the_raise() {
          EXCEPTION WHEN division_by_zero THEN RETURN x; END; RETURN 0; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     let NodeKind::Block(inner) = &block.statements[0].kind else { panic!("a block") };
     let value = returned(&inner.handlers[0].statements[0]);
     let evaluation = analysis.truth_under(Sql::Expression(value), &parsed("x = 2")).unwrap();
@@ -256,8 +252,7 @@ fn a_loop_whose_head_keeps_changing_still_exits_where_its_condition_fails() {
          IF i < 0 THEN RETURN 'negative'; END IF; RETURN i::text; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     let negative = if_condition(&block.statements[1]);
     assert!(!outcomes(&mut analysis, negative).truth);
 }
@@ -267,8 +262,7 @@ fn an_assert_contradicting_its_branch_never_holds() {
     // PostgreSQL answers `passed` for -1 and fails the assertion for 1.
     let block =
         embedded_sql("BEGIN IF n > 0 THEN ASSERT n < 0; END IF; RETURN 'passed'; END").unwrap();
-    let mut context = Parameters(vec![INTEGER]);
-    let mut analysis = analysis(&block, &["n"], &mut context);
+    let mut analysis = analysis(&block, &["n"], Parameters(vec![INTEGER]));
     let NodeKind::If(choice) = &block.statements[0].kind else { panic!("an IF") };
     let NodeKind::Assert(assert) = &choice.branches[0].statements[0].kind else {
         panic!("an ASSERT")
@@ -281,8 +275,7 @@ fn found_starts_false() {
     // PostgreSQL answers `unset`.
     let block =
         embedded_sql("BEGIN IF NOT FOUND THEN RETURN 'unset'; END IF; RETURN 'set'; END").unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     assert_eq!(outcomes(&mut analysis, if_condition(&block.statements[0])), Outcomes::TRUE);
     assert!(!analysis.reached(Sql::Expression(returned(&block.statements[1]))));
 }
@@ -295,8 +288,7 @@ fn an_integer_loop_index_stays_within_its_bounds() {
          RETURN 'within'; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     let NodeKind::Loop(repeated) = &block.statements[0].kind else { panic!("a loop") };
     assert_eq!(outcomes(&mut analysis, if_condition(&repeated.statements[0])), Outcomes::FALSE);
 }
@@ -308,8 +300,7 @@ fn an_assignment_reads_the_value_its_target_type_stores() {
         "DECLARE x int := 2.5; BEGIN IF x = 3 THEN RETURN 'three'; END IF; RETURN x::text; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     assert!(outcomes(&mut analysis, if_condition(&block.statements[0])).truth);
 }
 
@@ -325,8 +316,7 @@ fn an_assignment_its_target_type_refuses_raises_into_the_handler() {
     ];
     for (body, kept) in bodies.into_iter().zip(["x = 'ab'", "x = 1"]) {
         let block = embedded_sql(body).unwrap();
-        let mut context = Parameters(Vec::new());
-        let mut analysis = analysis(&block, &[], &mut context);
+        let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
         let NodeKind::Block(inner) = &block.statements[0].kind else { panic!("a block") };
         let value = Sql::Expression(returned(&inner.handlers[0].statements[0]));
         let evaluation = analysis.truth_under(value, &parsed(kept)).unwrap();
@@ -338,8 +328,7 @@ fn an_assignment_its_target_type_refuses_raises_into_the_handler() {
 /// statement, a `RETURN`.
 fn at_return(body: &str, parameters: &[&str], expressions: &[&str]) -> Vec<Outcomes> {
     let block = embedded_sql(body).unwrap();
-    let mut context = Parameters(vec![INTEGER; parameters.len()]);
-    let mut analysis = analysis(&block, parameters, &mut context);
+    let mut analysis = analysis(&block, parameters, Parameters(vec![INTEGER; parameters.len()]));
     let last = Sql::Expression(returned(block.statements.last().unwrap()));
     expressions
         .iter()
@@ -372,8 +361,7 @@ fn a_select_whose_where_fails_assigns_null_or_raises_under_strict() {
          RETURN 'found'; EXCEPTION WHEN no_data_found THEN RETURN w; END; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     let NodeKind::Block(inner) = &block.statements[0].kind else { panic!("a block") };
     assert!(!analysis.reached(Sql::Expression(returned(&inner.statements[1]))));
     let handled = Sql::Expression(returned(&inner.handlers[0].statements[0]));
@@ -387,8 +375,7 @@ fn a_select_assigns_only_where_its_where_holds() {
     let body = "DECLARE w int; BEGIN SELECT n INTO w WHERE n > 0; \
                 IF w <= 0 THEN RETURN 'nonpositive'; END IF; RETURN w; END";
     let block = embedded_sql(body).unwrap();
-    let mut context = Parameters(vec![INTEGER]);
-    let mut analysis = analysis(&block, &["n"], &mut context);
+    let mut analysis = analysis(&block, &["n"], Parameters(vec![INTEGER]));
     assert!(!outcomes(&mut analysis, if_condition(&block.statements[1])).truth);
 }
 
@@ -400,18 +387,13 @@ fn a_set_returning_select_may_assign_no_row() {
          IF FOUND THEN RETURN 'found'; END IF; RETURN 'not found'; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let analysis = analysis(&block, &[], &mut context);
+    let analysis = analysis(&block, &[], Parameters(Vec::new()));
     assert!(analysis.reached(Sql::Expression(returned(&block.statements[2]))));
 }
 
 /// The outcomes of `kept` where the first handler of the block `body` opens
 /// with returns, read through `context`.
-fn handled<C: values::Context<Error = Infallible>>(
-    body: &str,
-    kept: &str,
-    context: &mut C,
-) -> Outcomes {
+fn handled<C: values::Context<Error = Infallible>>(body: &str, kept: &str, context: C) -> Outcomes {
     let block = embedded_sql(body).unwrap();
     let mut analysis = analysis(&block, &[], context);
     let NodeKind::Block(inner) = &block.statements[0].kind else { panic!("a block") };
@@ -428,15 +410,14 @@ fn a_condition_of_another_type_is_cast_to_boolean() {
         "DECLARE x text := 'yes'; BEGIN IF x THEN RETURN 'then'; END IF; RETURN 'else'; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     assert!(outcomes(&mut analysis, if_condition(&block.statements[0])).truth);
     let NodeKind::If(choice) = &block.statements[0].kind else { panic!("an IF") };
     assert!(analysis.reached(Sql::Expression(returned(&choice.branches[0].statements[0]))));
     let raised = "DECLARE x text := 'maybe'; y int := 1; BEGIN BEGIN y := 2; \
                   IF x THEN y := 3; ELSE y := 3; END IF; y := 4; RETURN 0; \
                   EXCEPTION WHEN invalid_text_representation THEN RETURN y; END; END";
-    assert!(handled(raised, "y = 2", &mut Parameters(Vec::new())).truth);
+    assert!(handled(raised, "y = 2", Parameters(Vec::new())).truth);
 }
 
 #[test]
@@ -445,8 +426,7 @@ fn a_null_condition_of_another_type_reads_null() {
     let block =
         embedded_sql("DECLARE x text; BEGIN IF x THEN RETURN 'then'; END IF; RETURN 'else'; END")
             .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     assert_eq!(outcomes(&mut analysis, if_condition(&block.statements[0])), Outcomes::NULL);
 }
 
@@ -456,7 +436,7 @@ fn a_field_of_a_record_not_yet_assigned_raises() {
     let body = "DECLARE r record; y int := 1; BEGIN BEGIN y := 2; \
                 IF r.f IS NULL THEN y := 3; ELSE y := 3; END IF; y := 4; RETURN 0; \
                 EXCEPTION WHEN OTHERS THEN RETURN y; END; END";
-    assert!(handled(body, "y = 2", &mut Untyped).truth);
+    assert!(handled(body, "y = 2", Untyped).truth);
 }
 
 #[test]
@@ -470,8 +450,7 @@ fn widening_keeps_what_a_loop_never_changes() {
          IF k = 5 THEN RETURN 'five'; END IF; RETURN 'other'; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     assert_eq!(outcomes(&mut analysis, if_condition(&block.statements[1])), Outcomes::TRUE);
 }
 
@@ -480,8 +459,7 @@ fn nothing_is_read_where_no_path_reaches() {
     // PostgreSQL answers `early`.
     let block =
         embedded_sql("BEGIN RETURN 'early'; IF n > 0 THEN RETURN 'late'; END IF; END").unwrap();
-    let mut context = Parameters(vec![INTEGER]);
-    let mut analysis = analysis(&block, &["n"], &mut context);
+    let mut analysis = analysis(&block, &["n"], Parameters(vec![INTEGER]));
     let condition = if_condition(&block.statements[1]);
     assert!(analysis.condition(condition).unwrap().is_none());
     let read = analysis.truth_under(Sql::Expression(condition), &parsed("n > 0")).unwrap();
@@ -496,8 +474,7 @@ fn a_field_write_sets_the_field_and_a_subscript_write_forgets_the_array() {
          a[1] := coalesce(a[1], 5); RETURN r.f || a::text; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     let NodeKind::Assignment(subscripted) = &block.statements[2].kind else {
         panic!("an assignment")
     };
@@ -517,8 +494,7 @@ fn a_dynamic_command_reads_the_values_its_arguments_name() {
         "DECLARE v int := 1; x int; BEGIN EXECUTE 'SELECT $1' INTO x USING v; RETURN x; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     let NodeKind::Dynamic { dynamic, .. } = &block.statements[0].kind else { panic!("an EXECUTE") };
     let read = analysis.truth_under(Sql::Dynamic(dynamic), &parsed("v = 1")).unwrap();
     assert_eq!(read.unwrap().outcomes(), Outcomes::TRUE);
@@ -569,7 +545,7 @@ fn a_test_that_raises_reaches_the_handler_before_its_branch_runs() {
             "DECLARE v int := 0; y int := 1; BEGIN BEGIN y := 2; {statement}; y := 4; RETURN 0; \
              EXCEPTION WHEN OTHERS THEN RETURN y; END; END"
         );
-        assert!(handled(&body, "y = 2", &mut Parameters(Vec::new())).truth, "{statement}");
+        assert!(handled(&body, "y = 2", Parameters(Vec::new())).truth, "{statement}");
     }
 }
 
@@ -579,7 +555,7 @@ fn an_assert_that_holds_and_a_bare_exit_raise_nothing() {
     let body = "DECLARE v int := 1; y int := 1; BEGIN BEGIN y := 2; \
                 ASSERT v = 1, 'v is not one'; LOOP EXIT; END LOOP; y := 3; RETURN 0; \
                 EXCEPTION WHEN OTHERS THEN RETURN y; END; END";
-    assert!(!handled(body, "y = 2", &mut Parameters(Vec::new())).truth);
+    assert!(!handled(body, "y = 2", Parameters(Vec::new())).truth);
 }
 
 #[test]
@@ -595,8 +571,7 @@ fn casts_collations_and_subqueries_read_through_the_context() {
         ("BEGIN IF EXISTS (SELECT 1 FROM no_row) THEN RETURN 'then'; END IF; END", false),
     ] {
         let block = embedded_sql(body).unwrap();
-        let mut context = Parameters(Vec::new());
-        let mut analysis = analysis(&block, &[], &mut context);
+        let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
         let index = block.statements.len() - 1;
         assert_eq!(outcomes(&mut analysis, if_condition(&block.statements[index])).truth, read);
     }
@@ -614,10 +589,47 @@ fn a_name_no_variable_answers_reads_through_the_context() {
         ),
     ] {
         let block = embedded_sql(body).unwrap();
-        let mut context = Parameters(Vec::new());
-        let mut analysis = analysis(&block, &[], &mut context);
+        let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
         assert_eq!(outcomes(&mut analysis, if_condition(&block.statements[0])), over, "{body}");
     }
+}
+
+/// A context answering `bound_value` with the integer it holds, as a caller
+/// binds the names of an expression just before reading it.
+struct Bound(i64);
+
+impl sqlparser_expr_eval::Context for Bound {
+    type Reference = ();
+    type Error = Infallible;
+
+    fn reference(&mut self, expression: &Expr) -> Result<Option<Resolved<()>>, Infallible> {
+        let Expr::Identifier(identifier) = expression else { return Ok(None) };
+        Ok((identifier.value == "bound_value").then(|| {
+            Resolved {
+                reference: (),
+                evaluation: Evaluation::known(PgValue::Integer(self.0), INTEGER),
+            }
+        }))
+    }
+
+    fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Infallible> {
+        Ok(Vec::new())
+    }
+}
+
+impl values::Context for Bound {}
+
+#[test]
+fn an_expression_reads_what_the_context_holds_when_it_is_read() {
+    let block = embedded_sql("BEGIN RETURN 1; END").unwrap();
+    let mut analysis = analysis(&block, &[], Bound(1));
+    let site = Sql::Expression(returned(&block.statements[0]));
+    let seven = parsed("bound_value = 7");
+    let read = analysis.truth_under(site, &seven).unwrap().unwrap();
+    assert_eq!(read.outcomes(), Outcomes::FALSE);
+    analysis.context_mut().0 = 7;
+    let read = analysis.truth_under(site, &seven).unwrap().unwrap();
+    assert_eq!(read.outcomes(), Outcomes::TRUE);
 }
 
 #[test]
@@ -627,8 +639,7 @@ fn a_positional_parameter_reads_the_parameter_it_numbers() {
         "BEGIN IF n > 0 THEN IF $1 <= 0 THEN RETURN 'never'; END IF; END IF; RETURN 'other'; END",
     )
     .unwrap();
-    let mut context = Parameters(vec![INTEGER]);
-    let mut analysis = analysis(&block, &["n"], &mut context);
+    let mut analysis = analysis(&block, &["n"], Parameters(vec![INTEGER]));
     let NodeKind::If(outer) = &block.statements[0].kind else { panic!("an IF") };
     let inner = if_condition(&outer.branches[0].statements[0]);
     assert_eq!(outcomes(&mut analysis, inner), Outcomes::FALSE);
@@ -642,8 +653,7 @@ fn an_alias_and_a_copied_type_hold_what_is_assigned_them() {
          BEGIN a := 5; IF a = 5 AND x = 4 THEN RETURN 'five'; END IF; RETURN 'other'; END",
     )
     .unwrap();
-    let mut context = Parameters(vec![INTEGER]);
-    let mut analysis = analysis(&block, &["n"], &mut context);
+    let mut analysis = analysis(&block, &["n"], Parameters(vec![INTEGER]));
     assert!(outcomes(&mut analysis, if_condition(&block.statements[1])).truth);
 }
 
@@ -654,8 +664,7 @@ fn a_cursor_is_null_until_opened() {
         "DECLARE c CURSOR FOR SELECT 1; BEGIN IF c IS NULL THEN RETURN 'null'; END IF; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     assert!(outcomes(&mut analysis, if_condition(&block.statements[0])).truth);
 }
 
@@ -667,8 +676,7 @@ fn a_handler_reads_the_raised_sqlstate() {
          IF SQLSTATE = '22012' THEN RETURN 'division'; END IF; RETURN 'other'; END",
     )
     .unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     assert!(outcomes(&mut analysis, if_condition(&block.handlers[0].statements[0])).truth);
 }
 
