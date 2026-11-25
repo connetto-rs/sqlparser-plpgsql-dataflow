@@ -91,10 +91,10 @@ impl<'body, S> Flow<'body, S> {
 /// Where a statement or expression sits in the body, by the kind of SQL and
 /// its address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SiteKey(u8, usize);
+pub(crate) struct SiteKey(u8, usize);
 
 impl SiteKey {
-    fn of(sql: Sql<'_>) -> Self {
+    pub(crate) fn of(sql: Sql<'_>) -> Self {
         match sql {
             Sql::Statement(statement) => Self(0, address(statement)),
             Sql::Expression(query) => Self(1, address(query)),
@@ -104,7 +104,7 @@ impl SiteKey {
 }
 
 /// The address of `value`, which identifies it in the body.
-fn address<T>(value: &T) -> usize {
+pub(crate) fn address<T>(value: &T) -> usize {
     core::ptr::from_ref(value).addr()
 }
 
@@ -1072,13 +1072,13 @@ fn unresolved<E>(name: &dyn fmt::Display) -> Error<E> {
 /// The name an identifier written as `value` denotes, as PostgreSQL folds
 /// it, keeping a quoted one as written and folding any other to ASCII lower
 /// case.
-fn folded(value: &str, quoted: bool) -> String {
+pub(crate) fn folded(value: &str, quoted: bool) -> String {
     if quoted { value.into() } else { value.to_ascii_lowercase() }
 }
 
 /// The parts of `name` as PostgreSQL stores them. A part that is no
 /// identifier stays empty, which no declaration matches.
-fn stored_parts(name: &ObjectName) -> Vec<String> {
+pub(crate) fn stored_parts(name: &ObjectName) -> Vec<String> {
     name.0
         .iter()
         .map(|part| {
