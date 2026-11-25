@@ -126,8 +126,8 @@ type Names = BTreeMap<Vec<String>, Resolution>;
 /// expression, or about what the context resolves, holds only while the
 /// expression reading it runs, since the same text may name another variable
 /// or column at another point.
-pub struct Values<'context, C: Context> {
-    context: &'context mut C,
+pub struct Values<C: Context> {
+    context: C,
     /// The names each statement and expression of the body reaches.
     names: BTreeMap<SiteKey, Names>,
     /// The variable each declaration declares, by its address.
@@ -144,12 +144,12 @@ pub struct Values<'context, C: Context> {
 }
 
 /// The walk over one body with the [`Values`] domain, and what it left.
-pub struct Analysis<'body, 'context, C: Context> {
+pub struct Analysis<'body, C: Context> {
     flow: Flow<'body, State<C::Reference>>,
-    values: Values<'context, C>,
+    values: Values<C>,
 }
 
-impl<'body, C: Context> Analysis<'body, '_, C> {
+impl<'body, C: Context> Analysis<'body, C> {
     /// Whether a path reaches `sql`.
     #[must_use]
     pub fn reached(&self, sql: Sql<'body>) -> bool {
@@ -212,19 +212,19 @@ impl<'body, C: Context> Analysis<'body, '_, C> {
 /// # Errors
 ///
 /// Returns the errors [`walk`](crate::walk) returns, and the context's.
-pub fn analyze<'body, 'context, C: Context, K: Catalog>(
+pub fn analyze<'body, C: Context, K: Catalog>(
     block: &'body Block,
     signature: &Signature,
     transactions: Transactions,
     catalog: &mut K,
-    context: &'context mut C,
-) -> Result<Analysis<'body, 'context, C>, Error<C::Error>> {
+    context: C,
+) -> Result<Analysis<'body, C>, Error<C::Error>> {
     let mut values = Values::new(block, signature, &*catalog, context)?;
     let flow = walk(block, signature, transactions, catalog, &mut values)?;
     Ok(Analysis { flow, values })
 }
 
-impl<'context, C: Context> Values<'context, C> {
+impl<C: Context> Values<C> {
     /// The domain for `block`, the body of the routine `signature`
     /// describes, resolving its names with `catalog` and asking `context`
     /// what they hold.
@@ -236,7 +236,7 @@ impl<'context, C: Context> Values<'context, C> {
         block: &Block,
         signature: &Signature,
         catalog: &K,
-        context: &'context mut C,
+        context: C,
     ) -> Result<Self, Error<C::Error>> {
         let holds_row = |name: &Name| catalog.holds_row(name);
         let mut names = BTreeMap::new();
@@ -383,7 +383,7 @@ impl<'context, C: Context> Values<'context, C> {
 
     /// What `name`, or its field at `fields`, may hold by its type alone.
     fn base(&mut self, name: &Name, fields: &[String]) -> Result<Evaluation, C::Error> {
-        base(self.context, &mut self.bases, name, fields)
+        base(&mut self.context, &mut self.bases, name, fields)
     }
 
     /// What the variable `name`, or its field at `fields`, holds once
@@ -614,7 +614,7 @@ impl<'context, C: Context> Values<'context, C> {
     }
 }
 
-impl<'body, C: Context> Domain<'body> for Values<'_, C> {
+impl<'body, C: Context> Domain<'body> for Values<C> {
     type State = State<C::Reference>;
     type Error = C::Error;
 
