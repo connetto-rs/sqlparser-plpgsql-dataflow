@@ -768,6 +768,23 @@ fn a_loop_ends_where_a_raise_escapes_it() {
              END LOOP; END",
             true,
         ),
+        (
+            "BEGIN LOOP BEGIN RAISE EXCEPTION 'x' USING DETAIL = 'd'; \
+             EXCEPTION WHEN raise_exception THEN NULL; END; END LOOP; END",
+            false,
+        ),
+        // `others` catches neither the rethrown nor the computed
+        // `assert_failure`.
+        (
+            "BEGIN LOOP BEGIN BEGIN ASSERT false; EXCEPTION WHEN assert_failure THEN RAISE; END; \
+             EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP; END",
+            true,
+        ),
+        (
+            "DECLARE c text := 'assert_failure'; BEGIN LOOP BEGIN RAISE EXCEPTION USING ERRCODE = c; \
+             EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP; END",
+            true,
+        ),
     ] {
         assert_eq!(ends(body), [Some(ends_loop)], "{body}");
     }
