@@ -1,0 +1,52 @@
+[package]
+name = "sqlparser-plpgsql-dataflow"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Forward dataflow analysis over PL/pgSQL bodies, generic over what the walk carries."
+repository = "https://github.com/connetto-rs/sqlparser-plpgsql-dataflow"
+documentation = "https://docs.rs/sqlparser-plpgsql-dataflow"
+readme = "README.md"
+keywords = ["sql", "plpgsql", "postgresql", "dataflow", "static-analysis"]
+categories = ["database", "no-std"]
+
+[dependencies]
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main", default-features = false, features = ["visitor"] }
+sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", default-features = false, features = ["body-parse"] }
+sqlparser-expr-eval = { git = "https://github.com/connetto-rs/sqlparser-expr-eval", branch = "main", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+
+[features]
+default = ["std"]
+std = ["sqlparser/std", "sqlparser-plpgsql/std", "sqlparser-expr-eval/std", "thiserror/std"]
+
+[lints.rust]
+missing_docs = "forbid"
+unused_macro_rules = "forbid"
+unconditional_recursion = "forbid"
+unreachable_patterns = "forbid"
+unused_import_braces = "forbid"
+unused_must_use = "forbid"
+deprecated = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)", "cfg(coverage_nightly)"] }
+
+[lints.rustdoc]
+broken_intra_doc_links = "forbid"
+bare_urls = "forbid"
+invalid_codeblock_attributes = "forbid"
+invalid_html_tags = "forbid"
+missing_crate_level_docs = "forbid"
+unescaped_backticks = "forbid"
+redundant_explicit_links = "forbid"
+invalid_rust_codeblocks = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+clone_on_copy = "forbid"
+pedantic = { level = "deny", priority = -1 }
