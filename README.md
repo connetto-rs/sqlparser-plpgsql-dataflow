@@ -8,7 +8,7 @@
 
 Forward dataflow analysis over the PL/pgSQL bodies [`sqlparser-plpgsql`](https://github.com/connetto-rs/sqlparser-plpgsql) reads. [`walk`] follows a body through its blocks, branches, loops, exception handlers, `EXIT`, `CONTINUE`, `RETURN`, `RAISE` and transaction control, carrying the state a [`Domain`] defines, and answers the state reaching each statement and expression. The crate is `no_std`, needing only `alloc`.
 
-A domain says what a state is, how paths join, what a write and a test do to a state and where a raise may happen. Loops run until the state at their head stops changing, through the domain's widening. [`reaching::ReachingDefinitions`] is the domain of the writes that may have given each variable its value. Whatever only a catalog knows, whether a variable holds a row and what a `CALL` writes back, comes through [`Catalog`].
+A domain says what a state is, how paths join, what a write and a test do to a state and where a raise may happen. Loops run until the state at their head stops changing, through the domain's widening. [`reaching::ReachingDefinitions`] is the domain of the writes that may have given each variable its value. [`values::analyze`] walks a body with the guarantees [`sqlparser-expr-eval`](https://github.com/connetto-rs/sqlparser-expr-eval) carries through one expression, so [`values::Analysis::truth_under`] tells what an expression evaluates to given what each variable may hold where the body reaches it. Whatever only a catalog knows, whether a variable holds a row and what a `CALL` writes back, comes through [`Catalog`].
 
 ```rust
 use sqlparser::ast::Statement;
