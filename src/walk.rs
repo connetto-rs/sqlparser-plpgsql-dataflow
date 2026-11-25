@@ -1,7 +1,12 @@
 //! The walk over a body's control flow, generic over the [`Domain`] it
 //! carries.
 
-use alloc::{collections::BTreeMap, string::String, vec::Vec};
+use alloc::{
+    borrow::Cow,
+    collections::{BTreeMap, btree_map::Entry},
+    string::String,
+    vec::Vec,
+};
 use core::{fmt, marker::PhantomData};
 
 use sqlparser::ast::{
@@ -12,13 +17,14 @@ use sqlparser_expr_eval::Outcomes;
 use sqlparser_plpgsql::{
     embedded::{
         Assignment, Block, BoundCursor, Branch, Case, Declaration, DeclarationKind, Diagnostics,
-        Exit, ExitKind, Indirection, IntoTargets, Loop, LoopControl, Node, NodeKind, Open,
+        Exit, ExitKind, Handler, Indirection, IntoTargets, Loop, LoopControl, Node, NodeKind, Open,
         RaiseLevel, ReturnQuery, Target,
     },
     namespace::{self, Name, NameKind, Namespace, Signature, Sql, TriggerVariable, WriteSite},
 };
+use sqlstate::{SqlState, pg};
 
-use crate::{Domain, Found, Output, Part, Rows, Source, Step, Test, Write};
+use crate::{Domain, Found, Output, Part, Rows, Source, Step, Test, Write, raise};
 
 /// What only the catalog tells the walk about a body.
 pub trait Catalog {
@@ -60,7 +66,7 @@ pub enum Error<E> {
     Domain(E),
 }
 
-/// What the walk leaves at the statements and expressions of a body.
+/// What the walk leaves at the statements, expressions and loops of a body.
 #[derive(Clone, Debug)]
 pub struct Flow<'body, S> {
     /// The join of the states reaching each statement and expression.
@@ -68,6 +74,10 @@ pub struct Flow<'body, S> {
     /// The join of the states reaching the end of each `CASE` without `ELSE`
     /// with no `WHEN` matched, by the address of the `CASE`.
     unmatched: BTreeMap<usize, S>,
+    /// The join of the states entering each loop, by its address.
+    entered: BTreeMap<usize, S>,
+    /// The join of the states control leaves each loop with, by its address.
+    left: BTreeMap<usize, S>,
     body: PhantomData<&'body Block>,
 }
 
@@ -85,6 +95,36 @@ impl<'body, S> Flow<'body, S> {
     #[must_use]
     pub fn unmatched(&self, case: &'body Case) -> Option<&S> {
         self.unmatched.get(&address(case))
+    }
+
+    /// The join of the states a path enters `repeated` with, before its
+    /// control runs, `None` when no path reaches it.
+    #[must_use]
+    pub fn entered(&self, repeated: &'body Loop) -> Option<&S> {
+        self.entered.get(&address(repeated))
+    }
+
+    /// The join of the states control leaves `repeated` with, `None` when
+    /// control never leaves it.
+    ///
+    /// Control leaves a loop when its condition is false or `NULL`, its
+    /// range, rows or elements run out, an `EXIT` ends it, an `EXIT` or
+    /// `CONTINUE` inside it reaches a block or loop around it, a `RETURN`
+    /// inside it runs, or a step inside it surely raises an error no handler
+    /// inside it catches. The steps that surely raise are `RAISE EXCEPTION`,
+    /// an `ASSERT` whose condition fails, a `CASE` without `ELSE` matching no
+    /// `WHEN`, and `COMMIT` or `ROLLBACK` where they may not end the
+    /// transaction. A handler catches such a raise where the raise reports a
+    /// SQLSTATE known without running it and one of the handler's conditions
+    /// names it or its class, or is `others` and the SQLSTATE is neither
+    /// `query_canceled` nor `assert_failure`. A step that only may raise, as
+    /// [`Domain::may_raise`] tells, leaves no loop.
+    ///
+    /// A path continuing the body after the loop carries the writes the loop
+    /// makes as control leaves it, and a `RETURN` or a raise carries none.
+    #[must_use]
+    pub fn left(&self, repeated: &'body Loop) -> Option<&S> {
+        self.left.get(&address(repeated))
     }
 }
 
@@ -118,7 +158,8 @@ pub(crate) fn write_address(write: namespace::Write<'_>) -> usize {
 
 /// Walks `block`, the body of the routine `signature` describes, carrying
 /// `domain`'s states through its control flow, and gives the states reaching
-/// each of its statements and expressions.
+/// each of its statements and expressions and entering and leaving each of
+/// its loops.
 ///
 /// A block writes its declarations in order, then walks its statements, and
 /// its handlers start from every point among its statements where a raise
@@ -159,11 +200,19 @@ pub fn walk<'body, D: Domain<'body>, C: Catalog>(
         frames: Vec::new(),
         points: BTreeMap::new(),
         unmatched: BTreeMap::new(),
+        entered: BTreeMap::new(),
+        left: BTreeMap::new(),
         transactions,
     };
     let entry = walk.domain.entry().map_err(Error::Domain)?;
     walk.block(block, entry)?;
-    Ok(Flow { points: walk.points, unmatched: walk.unmatched, body: PhantomData })
+    Ok(Flow {
+        points: walk.points,
+        unmatched: walk.unmatched,
+        entered: walk.entered,
+        left: walk.left,
+        body: PhantomData,
+    })
 }
 
 /// A variable a target reaches, and the part of it written.
@@ -179,6 +228,8 @@ struct Resolved<'body> {
 struct Frame<'body, S> {
     label: Option<&'body str>,
     repeats: bool,
+    /// The block's handlers, none for a loop.
+    handlers: &'body [Handler],
     /// Whether the block's handlers catch what its statements raise, as they
     /// do while the walk is among those statements.
     catching: bool,
@@ -191,18 +242,27 @@ struct Frame<'body, S> {
     /// What a loop writes as control leaves it, by `EXIT` and `CONTINUE`
     /// passing through it too.
     leaving: Vec<Write<'body>>,
+    /// What control leaves the loop with, however it leaves.
+    left: Option<S>,
 }
 
 impl<'body, S> Frame<'body, S> {
-    const fn new(label: Option<&'body str>, repeats: bool, leaving: Vec<Write<'body>>) -> Self {
+    const fn new(
+        label: Option<&'body str>,
+        repeats: bool,
+        handlers: &'body [Handler],
+        leaving: Vec<Write<'body>>,
+    ) -> Self {
         Self {
             label,
             repeats,
+            handlers,
             catching: false,
             raised: None,
             exited: None,
             continued: None,
             leaving,
+            left: None,
         }
     }
 }
@@ -218,6 +278,8 @@ struct Walk<'body, 'run, D: Domain<'body>, C> {
     frames: Vec<Frame<'body, D::State>>,
     points: BTreeMap<SiteKey, D::State>,
     unmatched: BTreeMap<usize, D::State>,
+    entered: BTreeMap<usize, D::State>,
+    left: BTreeMap<usize, D::State>,
     transactions: Transactions,
 }
 
@@ -234,22 +296,14 @@ type Rounds<'body> = (Vec<Write<'body>>, Vec<Write<'body>>);
 impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
     /// Adds `from` to `into`, either of which no path may reach.
     fn join(&self, into: &mut Option<D::State>, from: Option<&D::State>) {
-        let Some(from) = from else { return };
-        match into {
-            Some(state) => self.domain.join(state, from),
-            None => *into = Some(from.clone()),
+        if let Some(from) = from {
+            add(&*self.domain, into, from);
         }
     }
 
     /// Records `state` as reaching `sql`.
     fn evaluated(&mut self, sql: Sql<'body>, state: &D::State) {
-        let key = SiteKey::of(sql);
-        match self.points.get_mut(&key) {
-            Some(reaching) => self.domain.join(reaching, state),
-            None => {
-                self.points.insert(key, state.clone());
-            }
-        }
+        record(&*self.domain, &mut self.points, SiteKey::of(sql), Cow::Borrowed(state));
     }
 
     /// Records `state` as reaching each expression of `queries`.
@@ -268,10 +322,27 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
     fn raised(&mut self, state: &D::State) {
         let domain = &*self.domain;
         for frame in self.frames.iter_mut().filter(|frame| frame.catching) {
-            match &mut frame.raised {
-                Some(raised) => domain.join(raised, state),
-                None => frame.raised = Some(state.clone()),
-            }
+            add(domain, &mut frame.raised, state);
+        }
+    }
+
+    /// Hands `state` to the enclosing handlers where a raise surely happens,
+    /// reporting `code`, `None` when only running it tells, and to every
+    /// loop it leaves, out to the innermost block whose handlers catch it.
+    fn raises(&mut self, code: Option<SqlState>, state: &D::State) {
+        self.raised(state);
+        let caught = self.frames.iter().rposition(|frame| {
+            frame.catching && code.is_some_and(|code| raise::caught(frame.handlers, code))
+        });
+        self.escape(caught.map_or(0, |index| index + 1), state);
+    }
+
+    /// Hands `state` to every loop among the frames from `outer` on, which
+    /// control leaves with it.
+    fn escape(&mut self, outer: usize, state: &D::State) {
+        let domain = &*self.domain;
+        for frame in self.frames[outer..].iter_mut().filter(|frame| frame.repeats) {
+            add(domain, &mut frame.left, state);
         }
     }
 
@@ -436,7 +507,8 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
     }
 
     /// Applies what each loop among `frames` writes as control leaves it to
-    /// `state`, innermost first. These writes raise nothing.
+    /// `state`, innermost first, and hands each loop what control leaves it
+    /// with. These writes raise nothing.
     fn leave(
         &mut self,
         frames: core::ops::Range<usize>,
@@ -446,6 +518,9 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
             let inputs = state.clone();
             for write in &self.frames[index].leaving {
                 self.domain.write(write, &inputs, state).map_err(Error::Domain)?;
+            }
+            if self.frames[index].repeats {
+                add(&*self.domain, &mut self.frames[index].left, state);
             }
         }
         Ok(())
@@ -514,13 +589,14 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
             }
             NodeKind::Close { .. } => {}
             NodeKind::Commit { .. } | NodeKind::Rollback { .. } => {
-                self.raised(&state);
                 // A handler in force opens a subtransaction, which may not
                 // commit.
                 let catching = self.frames.iter().any(|frame| frame.catching);
                 if self.transactions == Transactions::Refused || catching {
+                    self.raises(Some(pg::INVALID_TRANSACTION_TERMINATION), &state);
                     return Ok(None);
                 }
+                self.raised(&state);
             }
             NodeKind::Open(open) => self.open(node, open, &mut state)?,
             NodeKind::Block(block) => return self.block(block, state),
@@ -538,6 +614,7 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
             NodeKind::Exit(exit) => return self.exit(exit, state),
             NodeKind::Return { value } => {
                 self.evaluated_all(value.as_deref(), &state);
+                self.escape(0, &state);
                 return Ok(None);
             }
             NodeKind::ReturnNext { value } => self.evaluated_all(value.as_deref(), &state),
@@ -545,7 +622,7 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
                 let options = raise.options.iter().map(|option| &option.value);
                 self.evaluated_all(raise.arguments.iter().chain(options), &state);
                 if raise.level == RaiseLevel::Exception {
-                    self.raised(&state);
+                    self.raises(raise::reported(raise), &state);
                     return Ok(None);
                 }
             }
@@ -555,7 +632,7 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
                 let failed = self.assume(condition, Outcomes::NOT_TRUE, state.clone())?;
                 if let Some(failed) = failed {
                     self.evaluated_all(assert.message.as_deref(), &failed);
-                    self.raised(&failed);
+                    self.raises(Some(pg::ASSERT_FAILURE), &failed);
                 }
                 return self.assume(condition, Outcomes::TRUE, state);
             }
@@ -761,7 +838,7 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
     /// and each handler starts from what every raise among its statements
     /// leaves.
     fn block(&mut self, block: &'body Block, mut state: D::State) -> Leaves<D::State, D::Error> {
-        self.frames.push(Frame::new(block.label.as_deref(), false, Vec::new()));
+        self.frames.push(Frame::new(block.label.as_deref(), false, &block.handlers, Vec::new()));
         for declaration in &block.declarations {
             self.may_raise(Step::Declaration(declaration), &state)?;
             self.declaration(declaration, &mut state)?;
@@ -855,14 +932,8 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
             self.nodes(nodes, unmatched)?
         } else {
             if let Some(unmatched) = unmatched {
-                self.raised(&unmatched);
-                let key = address(case);
-                match self.unmatched.get_mut(&key) {
-                    Some(reaching) => self.domain.join(reaching, &unmatched),
-                    None => {
-                        self.unmatched.insert(key, unmatched);
-                    }
-                }
+                self.raises(Some(pg::CASE_NOT_FOUND), &unmatched);
+                record(&*self.domain, &mut self.unmatched, address(case), Cow::Owned(unmatched));
             }
             None
         };
@@ -889,8 +960,12 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
             }
             None => self.frames.iter().rposition(|frame| frame.repeats),
         };
-        if let (Some(index), Some(mut transfers)) = (frame, transfers) {
-            self.leave(index + 1..self.frames.len(), &mut transfers)?;
+        let Some(mut transfers) = transfers else { return Ok(falls) };
+        // A label nothing carries is the function's, so control leaves
+        // every block and loop.
+        let outer = frame.map_or(0, |index| index + 1);
+        self.leave(outer..self.frames.len(), &mut transfers)?;
+        if let Some(index) = frame {
             let domain = &*self.domain;
             let frame = &mut self.frames[index];
             let into = match exit.kind {
@@ -913,6 +988,7 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
         repeated: &'body Loop,
         entry: &D::State,
     ) -> Leaves<D::State, D::Error> {
+        record(&*self.domain, &mut self.entered, address(repeated), Cow::Borrowed(entry));
         match &repeated.control {
             LoopControl::Unconditional | LoopControl::While(_) => {}
             LoopControl::Range { lower, upper, step, .. } => {
@@ -945,7 +1021,7 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
         if let (LoopControl::Cursor { .. }, [_, portal]) = (&repeated.control, each.as_slice()) {
             leaving.push(Write { source: Source::PortalReleased, ..portal.clone() });
         }
-        self.frames.push(Frame::new(repeated.label.as_deref(), true, leaving));
+        self.frames.push(Frame::new(repeated.label.as_deref(), true, &[], leaving));
         let mut head = entry.clone();
         let mut round = 0;
         let back = loop {
@@ -992,7 +1068,9 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
             let index = self.frames.len() - 1;
             self.leave(index..index + 1, state)?;
         }
-        self.frames.pop();
+        if let Some(left) = self.frames.pop().and_then(|frame| frame.left) {
+            record(&*self.domain, &mut self.left, address(repeated), Cow::Owned(left));
+        }
         Ok(exit)
     }
 
@@ -1061,6 +1139,29 @@ impl<'body, D: Domain<'body>, C: Catalog> Walk<'body, '_, D, C> {
                 (self.targets(node, targets, true, site, source)?, Vec::new())
             }
         })
+    }
+}
+
+/// Adds `from` to `into`, which no path may reach.
+fn add<'body, D: Domain<'body>>(domain: &D, into: &mut Option<D::State>, from: &D::State) {
+    match into {
+        Some(state) => domain.join(state, from),
+        None => *into = Some(from.clone()),
+    }
+}
+
+/// Adds `state` to what `map` holds at `key`.
+fn record<'body, D: Domain<'body>, K: Ord>(
+    domain: &D,
+    map: &mut BTreeMap<K, D::State>,
+    key: K,
+    state: Cow<'_, D::State>,
+) {
+    match map.entry(key) {
+        Entry::Occupied(mut held) => domain.join(held.get_mut(), &state),
+        Entry::Vacant(vacant) => {
+            vacant.insert(state.into_owned());
+        }
     }
 }
 

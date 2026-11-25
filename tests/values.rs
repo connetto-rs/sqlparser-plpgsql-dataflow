@@ -13,7 +13,7 @@ use sqlparser_expr_eval::{
     sql_values::postgres::{IntegerType, PgValue},
 };
 use sqlparser_plpgsql::{
-    embedded::{Block, Node, NodeKind, embedded_sql},
+    embedded::{Block, Loop, Node, NodeKind, embedded_sql},
     namespace::{FunctionKind, Name, NameKind, Signature, Sql},
 };
 use sqlparser_plpgsql_dataflow::{
@@ -678,6 +678,141 @@ fn a_handler_reads_the_raised_sqlstate() {
     .unwrap();
     let mut analysis = analysis(&block, &[], Parameters(Vec::new()));
     assert!(outcomes(&mut analysis, if_condition(&block.handlers[0].statements[0])).truth);
+}
+
+#[test]
+fn a_loop_ends_where_control_leaves_it() {
+    // Each answer is one loop's, outer first. PostgreSQL runs every loop
+    // answering false until a statement timeout cancels it.
+    for (body, answers) in [
+        ("BEGIN LOOP PERFORM pg_sleep(1); END LOOP; END", [Some(false)].as_slice()),
+        (
+            "DECLARE n integer := 0; BEGIN WHILE n < 10 LOOP EXIT WHEN n > 3; END LOOP; END",
+            &[Some(false)],
+        ),
+        (
+            "DECLARE i integer := 0; BEGIN WHILE i < 10 LOOP i := i + 1; END LOOP; END",
+            &[Some(true)],
+        ),
+        ("BEGIN LOOP RETURN 1; END LOOP; END", &[Some(true)]),
+        ("BEGIN <<around>> LOOP LOOP EXIT around; END LOOP; END LOOP; END", &[Some(true); 2]),
+        (
+            "DECLARE k int := 0; BEGIN <<o>> LOOP k := k + 1; LOOP CONTINUE o; END LOOP; END LOOP; \
+             END",
+            &[Some(false), Some(true)],
+        ),
+        ("BEGIN LOOP <<b>> BEGIN EXIT b; END; END LOOP; END", &[Some(false)]),
+        // The function's own label ends the body.
+        ("BEGIN LOOP EXIT f; END LOOP; END", &[Some(true)]),
+        ("BEGIN RETURN 1; LOOP NULL; END LOOP; END", &[None]),
+    ] {
+        assert_eq!(ends(body), answers, "{body}");
+    }
+}
+
+#[test]
+fn a_loop_ends_where_a_raise_escapes_it() {
+    // Each answer is one loop's. PostgreSQL raises out of every loop
+    // answering true and runs every other until a statement timeout cancels
+    // it.
+    for (body, ends_loop) in [
+        ("BEGIN LOOP RAISE EXCEPTION 'stop'; END LOOP; END", true),
+        ("DECLARE x int := 0; BEGIN LOOP CASE x WHEN 1 THEN NULL; END CASE; END LOOP; END", true),
+        ("BEGIN LOOP ASSERT false; END LOOP; END", true),
+        ("BEGIN LOOP COMMIT; END LOOP; END", true),
+        (
+            "BEGIN LOOP RAISE EXCEPTION 'x'; END LOOP; EXCEPTION WHEN OTHERS THEN RETURN 1; END",
+            true,
+        ),
+        (
+            "BEGIN LOOP BEGIN RAISE EXCEPTION 'x'; EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP; END",
+            false,
+        ),
+        (
+            "BEGIN LOOP BEGIN RAISE EXCEPTION 'x'; EXCEPTION WHEN division_by_zero THEN NULL; END; \
+             END LOOP; END",
+            true,
+        ),
+        (
+            "BEGIN LOOP BEGIN RAISE division_by_zero; EXCEPTION WHEN data_exception THEN NULL; END; \
+             END LOOP; END",
+            false,
+        ),
+        (
+            "BEGIN LOOP BEGIN ASSERT false; EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP; END",
+            true,
+        ),
+        (
+            "BEGIN LOOP BEGIN ASSERT false; EXCEPTION WHEN assert_failure THEN NULL; END; END LOOP; \
+             END",
+            false,
+        ),
+        (
+            "BEGIN LOOP BEGIN RAISE EXCEPTION USING ERRCODE = 'unique_violation'; \
+             EXCEPTION WHEN unique_violation THEN NULL; END; END LOOP; END",
+            false,
+        ),
+        (
+            "BEGIN LOOP BEGIN RAISE EXCEPTION USING ERRCODE = 'no_such_thing'; \
+             EXCEPTION WHEN undefined_object THEN NULL; END; END LOOP; END",
+            false,
+        ),
+        // `MESSAGE` beside a format raises `syntax_error`.
+        (
+            "BEGIN LOOP BEGIN RAISE EXCEPTION 'x' USING MESSAGE = 'y'; \
+             EXCEPTION WHEN raise_exception THEN NULL; END; END LOOP; END",
+            true,
+        ),
+        (
+            "BEGIN LOOP BEGIN RAISE EXCEPTION 'x'; EXCEPTION WHEN SQLSTATE '00000' THEN NULL; END; \
+             END LOOP; END",
+            true,
+        ),
+        (
+            "BEGIN LOOP BEGIN RAISE EXCEPTION 'x' USING DETAIL = 'd'; \
+             EXCEPTION WHEN raise_exception THEN NULL; END; END LOOP; END",
+            false,
+        ),
+        // `others` catches neither the rethrown nor the computed
+        // `assert_failure`.
+        (
+            "BEGIN LOOP BEGIN BEGIN ASSERT false; EXCEPTION WHEN assert_failure THEN RAISE; END; \
+             EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP; END",
+            true,
+        ),
+        (
+            "DECLARE c text := 'assert_failure'; BEGIN LOOP BEGIN RAISE EXCEPTION USING ERRCODE = c; \
+             EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP; END",
+            true,
+        ),
+    ] {
+        assert_eq!(ends(body), [Some(ends_loop)], "{body}");
+    }
+}
+
+/// Whether control may leave each loop of `body`, the body of a function
+/// `f` without parameters, outer first.
+fn ends(body: &str) -> Vec<Option<bool>> {
+    let block = embedded_sql(body).unwrap();
+    let analysis = analysis(&block, &[], Parameters(Vec::new()));
+    loops(&block.statements).into_iter().map(|repeated| analysis.ends(repeated)).collect()
+}
+
+/// Every loop among `nodes` and the blocks and loops inside them, outer
+/// first.
+fn loops(nodes: &[Node]) -> Vec<&Loop> {
+    let mut found = Vec::new();
+    for node in nodes {
+        match &node.kind {
+            NodeKind::Loop(repeated) => {
+                found.push(repeated);
+                found.extend(loops(&repeated.statements));
+            }
+            NodeKind::Block(block) => found.extend(loops(&block.statements)),
+            _ => {}
+        }
+    }
+    found
 }
 
 /// `text` parsed as one PostgreSQL expression.

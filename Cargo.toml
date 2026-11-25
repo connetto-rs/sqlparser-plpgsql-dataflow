@@ -15,6 +15,7 @@ categories = ["database", "no-std"]
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main", default-features = false, features = ["visitor"] }
 sqlparser-plpgsql = { git = "https://github.com/connetto-rs/sqlparser-plpgsql", branch = "main", default-features = false, features = ["body-parse"] }
 sqlparser-expr-eval = { git = "https://github.com/connetto-rs/sqlparser-expr-eval", branch = "main", default-features = false }
+sqlstate = "0.2"
 thiserror = { version = "2.0", default-features = false }
 
 [features]
