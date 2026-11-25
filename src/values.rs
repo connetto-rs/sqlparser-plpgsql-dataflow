@@ -67,9 +67,10 @@ type Filtered<'state, R> = (Cow<'state, State<R>>, bool);
 /// collations.
 ///
 /// A name the body reaches as a variable resolves to
-/// [`Reference::Variable`]. The domain asks
-/// [`sqlparser_expr_eval::Context::reference`] only for the names no
-/// variable answers, and keeps no guarantee about what it answers past the
+/// [`Reference::Variable`], which a custom plan binds as a constant. The
+/// domain asks [`sqlparser_expr_eval::Context::reference`] and
+/// [`sqlparser_expr_eval::Context::may_plan_as_constant`] only for the names
+/// no variable answers, and keeps no guarantee about what it answers past the
 /// expression reading it. The domain reads a `SELECT` reading no relation
 /// itself, and the rows any other query returns into its targets come from
 /// [`sqlparser_expr_eval::Context::query`], under the guarantees about those
@@ -875,6 +876,15 @@ impl<C: Context> eval::Context for Scope<'_, C> {
 
     fn collation(&mut self, name: &ObjectName) -> Result<TextRules, C::Error> {
         self.context.collation(name)
+    }
+
+    /// PL/pgSQL binds every variable an embedded statement reads as a
+    /// parameter, which a custom plan folds as a constant.
+    fn may_plan_as_constant(&self, reference: &Self::Reference) -> bool {
+        match reference {
+            Reference::Variable { .. } => true,
+            Reference::Outer(reference) => self.context.may_plan_as_constant(reference),
+        }
     }
 }
 
