@@ -204,6 +204,16 @@ impl<'body, C: Context> Analysis<'body, C> {
         };
         self.values.condition(condition, state).map(|(evaluation, _)| Some(evaluation))
     }
+
+    /// The context the analysis reads through, for binding what an
+    /// expression passed to [`Analysis::truth_under`] names before reading
+    /// it.
+    ///
+    /// What the context answered during the walk stays in the analysis, so
+    /// a change to what it answers for the body's own names goes unseen.
+    pub fn context_mut(&mut self) -> &mut C {
+        &mut self.values.context
+    }
 }
 
 /// Walks `block`, the body of the routine `signature` describes, with the

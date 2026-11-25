@@ -594,6 +594,44 @@ fn a_name_no_variable_answers_reads_through_the_context() {
     }
 }
 
+/// A context answering `bound_value` with the integer it holds, as a caller
+/// binds the names of an expression just before reading it.
+struct Bound(i64);
+
+impl sqlparser_expr_eval::Context for Bound {
+    type Reference = ();
+    type Error = Infallible;
+
+    fn reference(&mut self, expression: &Expr) -> Result<Option<Resolved<()>>, Infallible> {
+        let Expr::Identifier(identifier) = expression else { return Ok(None) };
+        Ok((identifier.value == "bound_value").then(|| {
+            Resolved {
+                reference: (),
+                evaluation: Evaluation::known(PgValue::Integer(self.0), INTEGER),
+            }
+        }))
+    }
+
+    fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Infallible> {
+        Ok(Vec::new())
+    }
+}
+
+impl values::Context for Bound {}
+
+#[test]
+fn an_expression_reads_what_the_context_holds_when_it_is_read() {
+    let block = embedded_sql("BEGIN RETURN 1; END").unwrap();
+    let mut analysis = analysis(&block, &[], Bound(1));
+    let site = Sql::Expression(returned(&block.statements[0]));
+    let seven = parsed("bound_value = 7");
+    let read = analysis.truth_under(site, &seven).unwrap().unwrap();
+    assert_eq!(read.outcomes(), Outcomes::FALSE);
+    analysis.context_mut().0 = 7;
+    let read = analysis.truth_under(site, &seven).unwrap().unwrap();
+    assert_eq!(read.outcomes(), Outcomes::TRUE);
+}
+
 #[test]
 fn a_positional_parameter_reads_the_parameter_it_numbers() {
     // PostgreSQL answers `other` for 1, -1 and `NULL`.
