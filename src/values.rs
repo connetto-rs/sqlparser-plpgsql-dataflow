@@ -25,8 +25,7 @@ use sqlparser_expr_eval::{
 };
 use sqlparser_plpgsql::{
     embedded::{
-        self, Block, Case, Declaration, DeclarationKind, DeclaredType, Indirection, LoopControl,
-        NodeKind,
+        self, Block, Case, Declaration, DeclarationKind, DeclaredType, LoopControl, NodeKind,
     },
     namespace::{self, Name, NameKind, Signature, Sql},
 };
@@ -151,12 +150,6 @@ pub struct Analysis<'body, 'context, C: Context> {
 }
 
 impl<'body, C: Context> Analysis<'body, '_, C> {
-    /// The guarantees reaching each statement and expression.
-    #[must_use]
-    pub fn flow(&self) -> &Flow<'body, State<C::Reference>> {
-        &self.flow
-    }
-
     /// Whether a path reaches `sql`.
     #[must_use]
     pub fn reached(&self, sql: Sql<'body>) -> bool {
@@ -284,30 +277,21 @@ impl<'context, C: Context> Values<'context, C> {
         for site in block.write_sites(signature, holds_row)? {
             match site.write {
                 namespace::Write::Declaration(_) => {
-                    if let Some(name) = site.declared {
-                        declared.insert(write_address(site.write), name);
-                    }
+                    declared.extend(site.declared.map(|name| (write_address(site.write), name)));
                 }
                 namespace::Write::Node(node) => {
+                    // A target's indirection starts at its first subscript.
                     let NodeKind::Assignment(assignment) = &node.kind else { continue };
                     let parts = stored_parts(&assignment.target.name);
-                    let Some((name, consumed)) = site.namespace.lookup(&parts, holds_row) else {
-                        continue;
-                    };
-                    let mut fields = parts[consumed..].to_vec();
-                    let mut subscripted = false;
-                    for step in &assignment.target.indirection {
-                        match step {
-                            Indirection::Field(field) => {
-                                fields.push(folded(&field.value, field.quote_style.is_some()));
-                            }
-                            Indirection::Index(_) | Indirection::Slice { .. } => {
-                                subscripted = true;
-                            }
-                        }
-                    }
-                    if !subscripted {
-                        assigned.insert(address(node), Resolution { name: name.clone(), fields });
+                    let resolution = site
+                        .namespace
+                        .lookup(&parts, holds_row)
+                        .filter(|_| assignment.target.indirection.is_empty())
+                        .map(|(name, consumed)| {
+                            Resolution { name: name.clone(), fields: parts[consumed..].to_vec() }
+                        });
+                    if let Some(resolution) = resolution {
+                        assigned.insert(address(node), resolution);
                     }
                 }
             }
@@ -543,30 +527,25 @@ impl<'context, C: Context> Values<'context, C> {
         if !plain {
             return Ok(None);
         }
-        let mut answer = Ok(true);
-        let _ = visit_expressions(&select.projection, |expression| {
+        let read = visit_expressions(&select.projection, |expression| {
             let Expr::Function(call) = expression else { return ControlFlow::Continue(()) };
-            let scalar = call.over.is_none()
-                && match self.context.callees(call) {
-                    Ok(callees) => {
-                        !callees.is_empty()
-                            && callees.iter().all(|callee| {
-                                callee.kind == CalleeKind::Normal && !callee.returns_set
-                            })
-                    }
-                    Err(error) => {
-                        answer = Err(error);
-                        return ControlFlow::Break(());
-                    }
-                };
-            if scalar {
-                ControlFlow::Continue(())
-            } else {
-                answer = Ok(false);
-                ControlFlow::Break(())
+            match self.context.callees(call) {
+                Ok(callees)
+                    if call.over.is_none()
+                        && !callees.is_empty()
+                        && callees.iter().all(|callee| {
+                            callee.kind == CalleeKind::Normal && !callee.returns_set
+                        }) =>
+                {
+                    ControlFlow::Continue(())
+                }
+                answer => ControlFlow::Break(answer.map(|_| ())),
             }
         });
-        Ok(answer?.then_some(&**select))
+        match read {
+            ControlFlow::Continue(()) => Ok(Some(&**select)),
+            ControlFlow::Break(answer) => answer.map(|()| None),
+        }
     }
 
     /// `inputs` narrowed to where `select`, a [`Self::lone_row`], returns its
@@ -699,12 +678,11 @@ impl<'body, C: Context> Domain<'body> for Values<'_, C> {
         }
         let mut written = state.clone();
         written.retain(|subject| {
-            match subject {
-                Subject::Reference(Reference::Variable { id: other, fields: path }) => {
-                    *other != id || !(path.starts_with(&fields) || fields.starts_with(path))
-                }
-                Subject::Reference(Reference::Outer(_)) | Subject::Expression(_) => false,
-            }
+            !matches!(
+                subject,
+                Subject::Reference(Reference::Variable { id: other, fields: path })
+                    if *other == id && (path.starts_with(&fields) || fields.starts_with(path))
+            )
         });
         if !subscripted && let Some(value) = self.source(write, &fields, inputs)? {
             written.restrict(Subject::Reference(Reference::Variable { id, fields }), value);
@@ -884,9 +862,6 @@ impl<C: Context> eval::Context for Scope<'_, C> {
 /// The guarantees of `state` about what the context resolves, the only
 /// subjects the context knows.
 fn outer<R: Clone + Ord>(state: &Guarantees<Reference<R>>) -> Guarantees<R> {
-    if state.is_impossible() {
-        return Guarantees::impossible();
-    }
     let mut guarantees = Guarantees::new();
     for (reference, evaluation) in state.references() {
         if let Reference::Outer(reference) = reference {

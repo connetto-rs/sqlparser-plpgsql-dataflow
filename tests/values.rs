@@ -8,8 +8,9 @@ use sqlparser::{
     parser::Parser,
 };
 use sqlparser_expr_eval::{
-    Callee, CalleeKind, Evaluation, NullInput, NullResult, Outcomes, Resolved, ScalarType,
-    TextRules, Volatility, sql_values::postgres::IntegerType,
+    Callee, CalleeKind, Evaluation, Guarantees, NullInput, NullResult, Outcomes, QueryEvaluation,
+    Resolved, Rows, ScalarType, TextRules, Volatility,
+    sql_values::postgres::{IntegerType, PgValue},
 };
 use sqlparser_plpgsql::{
     embedded::{Block, Node, NodeKind, embedded_sql},
@@ -34,33 +35,58 @@ impl Catalog for Scalars {
     }
 }
 
-/// The types of a routine's parameters, and `generate_series` as the one
-/// function, returning a set of integers.
+/// The types of a routine's parameters, `generate_series` returning a set
+/// of integers, `abs` returning one, `limit_value` naming the integer 3
+/// outside the body, and the tables `one_row`, holding one row whose `k` is
+/// 4, and `no_row`, holding none.
 struct Parameters(Vec<ScalarType>);
 
 impl sqlparser_expr_eval::Context for Parameters {
     type Reference = ();
     type Error = Infallible;
 
-    fn reference(&mut self, _expression: &Expr) -> Result<Option<Resolved<()>>, Infallible> {
-        Ok(None)
+    fn reference(&mut self, expression: &Expr) -> Result<Option<Resolved<()>>, Infallible> {
+        let Expr::Identifier(ident) = expression else { return Ok(None) };
+        Ok((ident.value == "limit_value").then(|| {
+            Resolved { reference: (), evaluation: Evaluation::known(PgValue::Integer(3), INTEGER) }
+        }))
     }
 
     fn callees(&mut self, call: &Function) -> Result<Vec<Callee>, Infallible> {
-        if call.name.to_string() != "generate_series" {
-            return Ok(Vec::new());
-        }
-        let series = Callee::new(
+        let returns_set = match call.name.to_string().as_str() {
+            "generate_series" => true,
+            "abs" => false,
+            _ => return Ok(Vec::new()),
+        };
+        let callee = Callee::new(
             None,
             NullInput::Strict,
             NullResult::OnlyOnNullInput,
             Volatility::Immutable,
             CalleeKind::Normal,
             INTEGER,
-            true,
+            returns_set,
             0,
         );
-        Ok(vec![series])
+        Ok(vec![callee])
+    }
+
+    fn query(
+        &mut self,
+        query: &Query,
+        _guarantees: &Guarantees<()>,
+    ) -> Result<QueryEvaluation, Infallible> {
+        let text = query.to_string();
+        let k = Evaluation::known(PgValue::Integer(4), INTEGER);
+        Ok(if text.contains("FROM one_row") {
+            QueryEvaluation::new(Rows::ONE, Some(vec![k]), false)
+        } else if text.contains("FROM no_row") {
+            QueryEvaluation::new(Rows::NONE, Some(vec![k]), false)
+        } else if text.contains("FROM maybe_row") {
+            QueryEvaluation::new(Rows::new(true, true, false), Some(vec![k]), false)
+        } else {
+            QueryEvaluation::unknown()
+        })
     }
 }
 
@@ -70,10 +96,31 @@ impl values::Context for Parameters {
             NameKind::Parameter { position } => {
                 Evaluation::unknown(self.0[position - 1].clone()).with_error(false)
             }
+            // A field `f` holds an integer, and reading it raises until the
+            // record is assigned.
+            _ if fields == ["f"] => Evaluation::unknown(INTEGER),
             _ => Evaluation::unknown(ScalarType::Unknown).with_error(!fields.is_empty()),
         })
     }
 }
+
+/// A context answering nothing, so the domain reads every default.
+struct Untyped;
+
+impl sqlparser_expr_eval::Context for Untyped {
+    type Reference = ();
+    type Error = Infallible;
+
+    fn reference(&mut self, _expression: &Expr) -> Result<Option<Resolved<()>>, Infallible> {
+        Ok(None)
+    }
+
+    fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Infallible> {
+        Ok(Vec::new())
+    }
+}
+
+impl values::Context for Untyped {}
 
 const INTEGER: ScalarType = ScalarType::Integer(IntegerType::Integer);
 
@@ -86,18 +133,18 @@ fn signature(parameters: &[&str]) -> Signature {
     }
 }
 
-/// The walk over `block` with parameters `names` of types `types`.
-fn analysis<'body, 'context>(
+/// The walk over `block` with parameters `names`, read through `context`.
+fn analysis<'body, 'context, C: values::Context<Error = Infallible>>(
     block: &'body Block,
     names: &[&str],
-    context: &'context mut Parameters,
-) -> Analysis<'body, 'context, Parameters> {
+    context: &'context mut C,
+) -> Analysis<'body, 'context, C> {
     analyze(block, &signature(names), Transactions::Refused, &mut Scalars, context).unwrap()
 }
 
 /// The outcomes `condition` may take where the body reaches it.
-fn outcomes<'body>(
-    analysis: &mut Analysis<'body, '_, Parameters>,
+fn outcomes<'body, C: values::Context<Error = Infallible>>(
+    analysis: &mut Analysis<'body, '_, C>,
     condition: &'body Query,
 ) -> Outcomes {
     let evaluation = analysis.condition(condition).unwrap();
@@ -167,6 +214,22 @@ fn a_case_without_else_reaches_its_end_unless_a_when_holds() {
         let first = Sql::Expression(returned(&case.branches[0].statements[0]));
         assert_eq!(analysis.reached(first), unmatched, "{body}");
     }
+}
+
+#[test]
+fn a_when_listing_several_values_matches_any_of_them() {
+    // PostgreSQL answers `listed` for any argument.
+    let block = embedded_sql(
+        "BEGIN p := 'b'; CASE p WHEN 'a', 'b' THEN RETURN 'listed'; ELSE RETURN 'other'; \
+         END CASE; END",
+    )
+    .unwrap();
+    let mut context = Parameters(vec![ScalarType::Text(TextRules::DEFAULT)]);
+    let analysis = analysis(&block, &["p"], &mut context);
+    let NodeKind::Case(case) = &block.statements[1].kind else { panic!("a CASE") };
+    let otherwise = case.otherwise.as_ref().expect("an ELSE");
+    assert!(analysis.reached(Sql::Expression(returned(&case.branches[0].statements[0]))));
+    assert!(!analysis.reached(Sql::Expression(returned(&otherwise[0]))));
 }
 
 #[test]
@@ -343,11 +406,14 @@ fn a_set_returning_select_may_assign_no_row() {
 }
 
 /// The outcomes of `kept` where the first handler of the block `body` opens
-/// with returns.
-fn handled(body: &str, kept: &str) -> Outcomes {
+/// with returns, read through `context`.
+fn handled<C: values::Context<Error = Infallible>>(
+    body: &str,
+    kept: &str,
+    context: &mut C,
+) -> Outcomes {
     let block = embedded_sql(body).unwrap();
-    let mut context = Parameters(Vec::new());
-    let mut analysis = analysis(&block, &[], &mut context);
+    let mut analysis = analysis(&block, &[], context);
     let NodeKind::Block(inner) = &block.statements[0].kind else { panic!("a block") };
     let value = Sql::Expression(returned(&inner.handlers[0].statements[0]));
     let evaluation = analysis.truth_under(value, &parsed(kept)).unwrap();
@@ -370,7 +436,18 @@ fn a_condition_of_another_type_is_cast_to_boolean() {
     let raised = "DECLARE x text := 'maybe'; y int := 1; BEGIN BEGIN y := 2; \
                   IF x THEN y := 3; ELSE y := 3; END IF; y := 4; RETURN 0; \
                   EXCEPTION WHEN invalid_text_representation THEN RETURN y; END; END";
-    assert!(handled(raised, "y = 2").truth);
+    assert!(handled(raised, "y = 2", &mut Parameters(Vec::new())).truth);
+}
+
+#[test]
+fn a_null_condition_of_another_type_reads_null() {
+    // PostgreSQL answers `else`.
+    let block =
+        embedded_sql("DECLARE x text; BEGIN IF x THEN RETURN 'then'; END IF; RETURN 'else'; END")
+            .unwrap();
+    let mut context = Parameters(Vec::new());
+    let mut analysis = analysis(&block, &[], &mut context);
+    assert_eq!(outcomes(&mut analysis, if_condition(&block.statements[0])), Outcomes::NULL);
 }
 
 #[test]
@@ -379,22 +456,220 @@ fn a_field_of_a_record_not_yet_assigned_raises() {
     let body = "DECLARE r record; y int := 1; BEGIN BEGIN y := 2; \
                 IF r.f IS NULL THEN y := 3; ELSE y := 3; END IF; y := 4; RETURN 0; \
                 EXCEPTION WHEN OTHERS THEN RETURN y; END; END";
-    assert!(handled(body, "y = 2").truth);
+    assert!(handled(body, "y = 2", &mut Untyped).truth);
 }
 
 #[test]
 fn widening_keeps_what_a_loop_never_changes() {
     // PostgreSQL answers `five`.
     let block = embedded_sql(
-        "DECLARE c int := 5; i int := 0; a int := 0; b int := 0; \
-         BEGIN LOOP IF a = 1 THEN b := 1; END IF; IF i > 1000 THEN a := 1; END IF; \
+        "DECLARE i int := 0; a int := 0; b int := 0; c int := 0; d int := 0; k int := 5; \
+         BEGIN LOOP IF c = 1 THEN d := 1; END IF; IF b = 1 THEN c := 1; END IF; \
+         IF a = 1 THEN b := 1; END IF; IF i > 1000 THEN a := 1; END IF; \
          i := i + 1; EXIT WHEN i > 5; END LOOP; \
-         IF c = 5 THEN RETURN 'five'; END IF; RETURN 'other'; END",
+         IF k = 5 THEN RETURN 'five'; END IF; RETURN 'other'; END",
     )
     .unwrap();
     let mut context = Parameters(Vec::new());
     let mut analysis = analysis(&block, &[], &mut context);
     assert_eq!(outcomes(&mut analysis, if_condition(&block.statements[1])), Outcomes::TRUE);
+}
+
+#[test]
+fn nothing_is_read_where_no_path_reaches() {
+    // PostgreSQL answers `early`.
+    let block =
+        embedded_sql("BEGIN RETURN 'early'; IF n > 0 THEN RETURN 'late'; END IF; END").unwrap();
+    let mut context = Parameters(vec![INTEGER]);
+    let mut analysis = analysis(&block, &["n"], &mut context);
+    let condition = if_condition(&block.statements[1]);
+    assert!(analysis.condition(condition).unwrap().is_none());
+    let read = analysis.truth_under(Sql::Expression(condition), &parsed("n > 0")).unwrap();
+    assert!(read.is_none());
+}
+
+#[test]
+fn a_field_write_sets_the_field_and_a_subscript_write_forgets_the_array() {
+    // PostgreSQL answers `3{5}`, the subscript write making `a` non-null.
+    let block = embedded_sql(
+        "DECLARE r record; a int[]; BEGIN SELECT 1 AS f INTO r; r.f := 3; \
+         a[1] := coalesce(a[1], 5); RETURN r.f || a::text; END",
+    )
+    .unwrap();
+    let mut context = Parameters(Vec::new());
+    let mut analysis = analysis(&block, &[], &mut context);
+    let NodeKind::Assignment(subscripted) = &block.statements[2].kind else {
+        panic!("an assignment")
+    };
+    let before = Sql::Expression(&subscripted.value);
+    let null = parsed("a IS NULL");
+    assert_eq!(analysis.truth_under(before, &null).unwrap().unwrap().outcomes(), Outcomes::TRUE);
+    let last = Sql::Expression(returned(&block.statements[3]));
+    assert!(analysis.truth_under(last, &null).unwrap().unwrap().outcomes().falsity);
+    let field = analysis.truth_under(last, &parsed("r.f = 3")).unwrap().unwrap();
+    assert_eq!(field.outcomes(), Outcomes::TRUE);
+}
+
+#[test]
+fn a_dynamic_command_reads_the_values_its_arguments_name() {
+    // PostgreSQL answers 1.
+    let block = embedded_sql(
+        "DECLARE v int := 1; x int; BEGIN EXECUTE 'SELECT $1' INTO x USING v; RETURN x; END",
+    )
+    .unwrap();
+    let mut context = Parameters(Vec::new());
+    let mut analysis = analysis(&block, &[], &mut context);
+    let NodeKind::Dynamic { dynamic, .. } = &block.statements[0].kind else { panic!("an EXECUTE") };
+    let read = analysis.truth_under(Sql::Dynamic(dynamic), &parsed("v = 1")).unwrap();
+    assert_eq!(read.unwrap().outcomes(), Outcomes::TRUE);
+}
+
+#[test]
+fn a_query_reading_a_relation_assigns_what_the_context_returns() {
+    // PostgreSQL answers `4 t 0`, and `maybe_row` may hold the one row or
+    // none.
+    let body = "DECLARE x int; y int := 7; z int := 9; w int; counted int; \
+                BEGIN SELECT k INTO x FROM one_row; SELECT k INTO y FROM no_row; \
+                SELECT k INTO z FROM maybe_row; SELECT k INTO w FROM elsewhere; \
+                GET DIAGNOSTICS counted = ROW_COUNT; RETURN x || (y IS NULL) || z || w || counted; END";
+    let read = at_return(body, &[], &["x = 4", "y IS NULL", "z = 4", "w IS NULL"]);
+    assert_eq!(read[..2], [Outcomes::TRUE; 2]);
+    assert_eq!(read[2], Outcomes::TRUE.union(Outcomes::NULL));
+    assert!(read[3].truth && read[3].falsity);
+}
+
+#[test]
+fn a_select_whose_row_count_the_domain_cannot_tell_may_leave_found_false() {
+    // PostgreSQL answers `f`, `f` and `t`.
+    let either = Outcomes::TRUE.union(Outcomes::FALSE);
+    for (select, found) in [
+        ("SELECT 1 INTO x LIMIT 0", either),
+        ("SELECT 1 INTO x HAVING false", either),
+        ("SELECT abs(-1) INTO x", Outcomes::TRUE),
+    ] {
+        let body = format!("DECLARE x int; BEGIN {select}; RETURN found; END");
+        assert_eq!(at_return(&body, &[], &["found"]), [found], "{select}");
+    }
+}
+
+#[test]
+fn a_test_that_raises_reaches_the_handler_before_its_branch_runs() {
+    // PostgreSQL answers 2 for each, raising `division_by_zero`, or
+    // `syntax_error` for a `WHEN` that lists no plain values.
+    for statement in [
+        "CASE WHEN 1 / v > 0 THEN y := 3; ELSE y := 3; END CASE",
+        "CASE 1 / v WHEN 1 THEN y := 3; ELSE y := 3; END CASE",
+        "ASSERT 1 / v > 0",
+        "CASE 1 WHEN 1 FROM one_row THEN y := 3; ELSE y := 3; END CASE",
+        "CASE 1 WHEN 1 AS a THEN y := 3; ELSE y := 3; END CASE",
+        "CASE 1 WHEN 1 WHERE false THEN y := 3; ELSE y := 3; END CASE",
+        "CASE 1 WHEN 1 / v THEN y := 3; ELSE y := 3; END CASE",
+    ] {
+        let body = format!(
+            "DECLARE v int := 0; y int := 1; BEGIN BEGIN y := 2; {statement}; y := 4; RETURN 0; \
+             EXCEPTION WHEN OTHERS THEN RETURN y; END; END"
+        );
+        assert!(handled(&body, "y = 2", &mut Parameters(Vec::new())).truth, "{statement}");
+    }
+}
+
+#[test]
+fn an_assert_that_holds_and_a_bare_exit_raise_nothing() {
+    // PostgreSQL answers 0, never entering the handler.
+    let body = "DECLARE v int := 1; y int := 1; BEGIN BEGIN y := 2; \
+                ASSERT v = 1, 'v is not one'; LOOP EXIT; END LOOP; y := 3; RETURN 0; \
+                EXCEPTION WHEN OTHERS THEN RETURN y; END; END";
+    assert!(!handled(body, "y = 2", &mut Parameters(Vec::new())).truth);
+}
+
+#[test]
+fn casts_collations_and_subqueries_read_through_the_context() {
+    // PostgreSQL answers `then`, `then` and `else`.
+    for (body, read) in [
+        ("DECLARE x text := '5'; BEGIN IF x::int > 3 THEN RETURN 'then'; END IF; END", true),
+        (
+            "DECLARE x text COLLATE \"C\" := 'a'; \
+             BEGIN IF x < 'b' COLLATE \"C\" THEN RETURN 'then'; END IF; END",
+            true,
+        ),
+        ("BEGIN IF EXISTS (SELECT 1 FROM no_row) THEN RETURN 'then'; END IF; END", false),
+    ] {
+        let block = embedded_sql(body).unwrap();
+        let mut context = Parameters(Vec::new());
+        let mut analysis = analysis(&block, &[], &mut context);
+        let index = block.statements.len() - 1;
+        assert_eq!(outcomes(&mut analysis, if_condition(&block.statements[index])).truth, read);
+    }
+}
+
+#[test]
+fn a_name_no_variable_answers_reads_through_the_context() {
+    // The context answers 3 for `limit_value`, which a variable shadows.
+    for (body, over) in [
+        ("BEGIN IF limit_value > 5 THEN RETURN 'over'; END IF; END", Outcomes::FALSE),
+        (
+            "DECLARE limit_value int := 9; \
+             BEGIN IF limit_value > 5 THEN RETURN 'over'; END IF; END",
+            Outcomes::TRUE,
+        ),
+    ] {
+        let block = embedded_sql(body).unwrap();
+        let mut context = Parameters(Vec::new());
+        let mut analysis = analysis(&block, &[], &mut context);
+        assert_eq!(outcomes(&mut analysis, if_condition(&block.statements[0])), over, "{body}");
+    }
+}
+
+#[test]
+fn a_positional_parameter_reads_the_parameter_it_numbers() {
+    // PostgreSQL answers `other` for 1, -1 and `NULL`.
+    let block = embedded_sql(
+        "BEGIN IF n > 0 THEN IF $1 <= 0 THEN RETURN 'never'; END IF; END IF; RETURN 'other'; END",
+    )
+    .unwrap();
+    let mut context = Parameters(vec![INTEGER]);
+    let mut analysis = analysis(&block, &["n"], &mut context);
+    let NodeKind::If(outer) = &block.statements[0].kind else { panic!("an IF") };
+    let inner = if_condition(&outer.branches[0].statements[0]);
+    assert_eq!(outcomes(&mut analysis, inner), Outcomes::FALSE);
+}
+
+#[test]
+fn an_alias_and_a_copied_type_hold_what_is_assigned_them() {
+    // PostgreSQL answers `five`.
+    let block = embedded_sql(
+        "DECLARE a ALIAS FOR $1; x n%TYPE := 4; \
+         BEGIN a := 5; IF a = 5 AND x = 4 THEN RETURN 'five'; END IF; RETURN 'other'; END",
+    )
+    .unwrap();
+    let mut context = Parameters(vec![INTEGER]);
+    let mut analysis = analysis(&block, &["n"], &mut context);
+    assert!(outcomes(&mut analysis, if_condition(&block.statements[1])).truth);
+}
+
+#[test]
+fn a_cursor_is_null_until_opened() {
+    // PostgreSQL answers `null`.
+    let block = embedded_sql(
+        "DECLARE c CURSOR FOR SELECT 1; BEGIN IF c IS NULL THEN RETURN 'null'; END IF; END",
+    )
+    .unwrap();
+    let mut context = Parameters(Vec::new());
+    let mut analysis = analysis(&block, &[], &mut context);
+    assert!(outcomes(&mut analysis, if_condition(&block.statements[0])).truth);
+}
+
+#[test]
+fn a_handler_reads_the_raised_sqlstate() {
+    // PostgreSQL answers `division`.
+    let block = embedded_sql(
+        "BEGIN PERFORM 1 / 0; RETURN 'none'; EXCEPTION WHEN OTHERS THEN \
+         IF SQLSTATE = '22012' THEN RETURN 'division'; END IF; RETURN 'other'; END",
+    )
+    .unwrap();
+    let mut context = Parameters(Vec::new());
+    let mut analysis = analysis(&block, &[], &mut context);
+    assert!(outcomes(&mut analysis, if_condition(&block.handlers[0].statements[0])).truth);
 }
 
 /// `text` parsed as one PostgreSQL expression.
