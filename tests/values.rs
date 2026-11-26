@@ -17,7 +17,7 @@ use sqlparser_plpgsql::{
     namespace::{FunctionKind, Name, NameKind, Signature, Sql},
 };
 use sqlparser_plpgsql_dataflow::{
-    Catalog, Transactions,
+    Catalog, Ending, Escape, Return, Step, Transactions,
     values::{self, Analysis, analyze},
 };
 
@@ -139,7 +139,8 @@ fn analysis<'body, C: values::Context<Error = Infallible>>(
     names: &[&str],
     context: C,
 ) -> Analysis<'body, C> {
-    analyze(block, &signature(names), Transactions::Refused, &mut Scalars, context).unwrap()
+    analyze(block, &signature(names), Transactions::Refused, Ending::Raises, &mut Scalars, context)
+        .unwrap()
 }
 
 /// The outcomes `condition` may take where the body reaches it.
@@ -691,8 +692,15 @@ fn a_strict_operator_beside_a_variable_may_fold_before_its_operand_raises() {
             parameters: parameters.iter().map(|name| Some((*name).into())).collect(),
             kind,
         };
-        let mut analysis =
-            analyze(&block, &signature, Transactions::Refused, &mut Scalars, Columns(&[])).unwrap();
+        let mut analysis = analyze(
+            &block,
+            &signature,
+            Transactions::Refused,
+            Ending::Raises,
+            &mut Scalars,
+            Columns(&[]),
+        )
+        .unwrap();
         let site = Sql::Expression(returned(block.statements.last().unwrap()));
         let read = analysis.truth_under(site, &parsed(compared)).unwrap().unwrap();
         assert!(read.may_be_null() && !read.always_raises(), "{compared}");
@@ -865,6 +873,64 @@ fn a_loop_ends_where_a_raise_escapes_it() {
         ),
     ] {
         assert_eq!(ends(body), [Some(ends_loop)], "{body}");
+    }
+}
+
+/// How a test spells the step `node` is.
+fn kind(node: &Node) -> &'static str {
+    match node.kind {
+        NodeKind::Return { .. } => "RETURN",
+        NodeKind::Raise(_) => "RAISE",
+        _ => "another step",
+    }
+}
+
+#[test]
+fn a_return_or_raise_is_reached_only_where_a_possible_state_reaches_it() {
+    // PostgreSQL returns from the first where `x` is 5 and raises `P0001`
+    // where it is 0, and returns 5 from the second where `x` is 5 and raises
+    // `2F005` where it is 0.
+    let returns_void = "BEGIN IF x > 0 THEN RETURN; END IF; RAISE EXCEPTION 'not positive'; END";
+    let returns_integer = "BEGIN IF x > 0 THEN RETURN x; END IF; END";
+    for (body, ending, x, returns, escapes) in [
+        (returns_void, Ending::Returns, 5, ["RETURN"].as_slice(), [].as_slice()),
+        (returns_void, Ending::Returns, 0, &[], &["may raise at RAISE", "raises at RAISE"]),
+        (returns_integer, Ending::Raises, 5, &["RETURN"], &["may raise at RETURN"]),
+        (returns_integer, Ending::Raises, 0, &[], &["raises at the end"]),
+    ] {
+        let body = format!("DECLARE x int := {x}; {body}");
+        let block = embedded_sql(&body).unwrap();
+        let analysis = analyze(
+            &block,
+            &signature(&[]),
+            Transactions::Refused,
+            ending,
+            &mut Scalars,
+            Parameters(Vec::new()),
+        )
+        .unwrap();
+        let reached: Vec<_> = analysis
+            .returns()
+            .map(|at| {
+                match at {
+                    Return::Statement(node) => kind(node),
+                    Return::End => "the end",
+                }
+            })
+            .collect();
+        assert_eq!(reached, returns, "{body}");
+        let escaped: Vec<_> = analysis
+            .escapes()
+            .map(|at| {
+                match at {
+                    Escape::Raises(Step::Node(node)) => format!("raises at {}", kind(node)),
+                    Escape::MayRaise(Step::Node(node)) => format!("may raise at {}", kind(node)),
+                    Escape::Raises(_) | Escape::MayRaise(_) => "elsewhere".to_owned(),
+                    Escape::End => "raises at the end".to_owned(),
+                }
+            })
+            .collect();
+        assert_eq!(escaped, escapes, "{body}");
     }
 }
 

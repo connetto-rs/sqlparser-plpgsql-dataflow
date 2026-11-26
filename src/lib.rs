@@ -13,5 +13,5 @@ mod walk;
 mod write;
 
 pub use domain::{Domain, Step, Test};
-pub use walk::{Catalog, Error, Flow, Transactions, walk};
+pub use walk::{Catalog, Ending, Error, Escape, Flow, Return, Transactions, walk};
 pub use write::{Found, Output, Part, Rows, Source, Write};

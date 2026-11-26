@@ -31,8 +31,8 @@ use sqlparser_plpgsql::{
 };
 
 use crate::{
-    Catalog, Domain, Error, Flow, Found, Output, Part, Rows, Source, Step, Test, Transactions,
-    Write,
+    Catalog, Domain, Ending, Error, Escape, Flow, Found, Output, Part, Return, Rows, Source, Step,
+    Test, Transactions, Write,
     walk::{SiteKey, address, folded, stored_parts, walk, write_address},
 };
 
@@ -173,6 +173,18 @@ impl<'body, C: Context> Analysis<'body, C> {
         Some(self.flow.left(repeated).is_some_and(|state| !state.is_impossible()))
     }
 
+    /// Each point where control returns from the body, as [`Flow::returns`]
+    /// tells, that a path reaches.
+    pub fn returns(&self) -> impl Iterator<Item = Return<'body>> {
+        self.flow.returns().filter(|(_, state)| !state.is_impossible()).map(|(at, _)| at)
+    }
+
+    /// Each point where an error may leave the body, as [`Flow::escapes`]
+    /// tells, that a path reaches.
+    pub fn escapes(&self) -> impl Iterator<Item = Escape<'body>> {
+        self.flow.escapes().filter(|(_, state)| !state.is_impossible()).map(|(at, _)| at)
+    }
+
     /// What `expression` evaluates to under the guarantees reaching `sql`,
     /// `None` when no path reaches it.
     ///
@@ -227,7 +239,8 @@ impl<'body, C: Context> Analysis<'body, C> {
 }
 
 /// Walks `block`, the body of the routine `signature` describes, with the
-/// [`Values`] domain over `context`.
+/// [`Values`] domain over `context`, `ending` telling what control reaching
+/// the end of the body does.
 ///
 /// # Errors
 ///
@@ -236,11 +249,12 @@ pub fn analyze<'body, C: Context, K: Catalog>(
     block: &'body Block,
     signature: &Signature,
     transactions: Transactions,
+    ending: Ending,
     catalog: &mut K,
     context: C,
 ) -> Result<Analysis<'body, C>, Error<C::Error>> {
     let mut values = Values::new(block, signature, &*catalog, context)?;
-    let flow = walk(block, signature, transactions, catalog, &mut values)?;
+    let flow = walk(block, signature, transactions, ending, catalog, &mut values)?;
     Ok(Analysis { flow, values })
 }
 

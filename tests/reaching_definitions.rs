@@ -8,11 +8,11 @@ use core::ops::ControlFlow;
 
 use sqlparser::ast::{Expr, Query, Statement, Value, visit_expressions};
 use sqlparser_plpgsql::{
-    embedded::{DeclarationKind, DeclaredType, Dynamic, embedded_sql},
+    embedded::{DeclarationKind, DeclaredType, Dynamic, NodeKind, embedded_sql},
     namespace::{FunctionKind, Name, NameKind, Namespace, Signature, Sql},
 };
 use sqlparser_plpgsql_dataflow::{
-    Catalog, Part, Source, Transactions,
+    Catalog, Ending, Escape, Part, Return, Source, Step, Transactions,
     reaching::{ReachingDefinitions, Slot, State},
     walk,
 };
@@ -168,7 +168,8 @@ fn reaching_with(
 ) -> Vec<Vec<(String, Vec<String>)>> {
     let block = embedded_sql(body).unwrap();
     let mut domain = ReachingDefinitions::new();
-    let flow = walk(&block, signature, transactions, &mut schema, &mut domain).unwrap();
+    let flow =
+        walk(&block, signature, transactions, Ending::Raises, &mut schema, &mut domain).unwrap();
     let sites = block.sites(signature, |name| schema.holds_row(name)).unwrap();
     sites
         .iter()
@@ -667,7 +668,15 @@ fn a_declaration_in_a_loop_reads_the_previous_iteration() {
     )
     .unwrap();
     let mut domain = ReachingDefinitions::new();
-    walk(&block, &run(), Transactions::Refused, &mut Schema::default(), &mut domain).unwrap();
+    walk(
+        &block,
+        &run(),
+        Transactions::Refused,
+        Ending::Raises,
+        &mut Schema::default(),
+        &mut domain,
+    )
+    .unwrap();
     let default = domain
         .definitions()
         .iter()
@@ -820,6 +829,81 @@ fn notices_continue_and_returns_end_the_path() {
     );
 }
 
+/// The definitions each variable `state` holds a write's definition of, by
+/// its name in `signature`.
+fn holding(
+    state: &State,
+    domain: &ReachingDefinitions<'_>,
+    signature: &Signature,
+) -> Vec<(String, Vec<String>)> {
+    state
+        .values()
+        .map(|slots| {
+            let name = slots
+                .iter()
+                .find_map(|slot| {
+                    let Slot::Written(index) = slot else { return None };
+                    Some(&domain.definitions()[*index].write.variable)
+                })
+                .unwrap();
+            let definitions = slots.iter().map(|slot| rendered(*slot, domain)).collect();
+            (variable(name, signature), definitions)
+        })
+        .collect()
+}
+
+/// A function with output parameters returns at the end of its body with
+/// the definitions its last assignments gave them, and a `RAISE EXCEPTION`
+/// beside the end leaves the body with the same definitions.
+#[test]
+fn the_end_of_a_function_with_output_parameters_returns_what_they_hold() {
+    let signature = Signature {
+        name: "acting_installation".to_owned(),
+        parameters: vec![Some("namespace_id".to_owned()), Some("id".to_owned())],
+        kind: FunctionKind::Plain,
+    };
+    let block = embedded_sql(
+        "BEGIN
+          namespace_id := NULLIF(current_setting('app.installation_namespace_id', true), '')::UUID;
+          id := NULLIF(current_setting('app.installation_id', true), '')::UUID;
+          IF (namespace_id IS NULL) <> (id IS NULL) THEN
+           RAISE EXCEPTION 'incomplete installation identity' USING ERRCODE = '22023';
+          END IF;
+         END",
+    )
+    .unwrap();
+    let mut domain = ReachingDefinitions::new();
+    let flow = walk(
+        &block,
+        &signature,
+        Transactions::Refused,
+        Ending::Returns,
+        &mut Schema::default(),
+        &mut domain,
+    )
+    .unwrap();
+    let assigned = [
+        read(
+            "namespace_id",
+            &["NULLIF(current_setting('app.installation_namespace_id', true), '')::UUID"],
+        ),
+        read("id", &["NULLIF(current_setting('app.installation_id', true), '')::UUID"]),
+    ];
+    let returns: Vec<_> = flow
+        .returns()
+        .map(|(at, state)| (matches!(at, Return::End), holding(state, &domain, &signature)))
+        .collect();
+    assert_eq!(returns, [(true, assigned.to_vec())]);
+    let raises: Vec<_> = flow
+        .escapes()
+        .filter_map(|(at, state)| {
+            let Escape::Raises(Step::Node(node)) = at else { return None };
+            Some((matches!(node.kind, NodeKind::Raise(_)), holding(state, &domain, &signature)))
+        })
+        .collect();
+    assert_eq!(raises, [(true, assigned.to_vec())]);
+}
+
 /// A `CALL` reaching no single procedure may write back to a variable passed
 /// in parentheses, under a cast or by position, and to no computed argument.
 #[test]
@@ -942,8 +1026,14 @@ fn a_write_to_an_undeclared_name_is_unresolvable() {
     ] {
         let block = embedded_sql(body).unwrap();
         let mut domain = ReachingDefinitions::new();
-        let walked =
-            walk(&block, &run(), Transactions::Refused, &mut Schema::default(), &mut domain);
+        let walked = walk(
+            &block,
+            &run(),
+            Transactions::Refused,
+            Ending::Raises,
+            &mut Schema::default(),
+            &mut domain,
+        );
         assert!(
             matches!(
                 &walked,
