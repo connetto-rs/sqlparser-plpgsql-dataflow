@@ -107,6 +107,25 @@ pub trait Context: eval::Context {
         let _ = (variable, fields);
         Ok(None)
     }
+
+    /// Whether the constraints of the domain `data_type` names may refuse
+    /// `value`, already of the domain's base type, `NULL` included.
+    ///
+    /// PL/pgSQL checks them on each assignment to a variable declared
+    /// `data_type`, and on the `NULL` it assigns a variable declared without
+    /// a default as its block starts. The default reads no type as a domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns the context's error when it cannot tell.
+    fn domain_may_refuse(
+        &mut self,
+        data_type: &DataType,
+        value: &Evaluation,
+    ) -> Result<bool, Self::Error> {
+        let _ = (data_type, value);
+        Ok(false)
+    }
 }
 
 /// The variable a name reaches where the body reads it, and the field path
@@ -421,7 +440,8 @@ impl<C: Context> Values<C> {
     }
 
     /// What the variable `name`, or its field at `fields`, holds once
-    /// assigned `value`, and whether the assignment may raise.
+    /// assigned `value`, and whether converting `value` to its type, or its
+    /// declared `NOT NULL`, may refuse it.
     fn assign(
         &mut self,
         value: &Evaluation,
@@ -444,6 +464,28 @@ impl<C: Context> Values<C> {
         };
         let not_null = declared.is_some_and(|variable| variable.not_null);
         Ok(assigned(value, &base, unmodified, not_null))
+    }
+
+    /// Whether assigning `value` to the variable `name`, or its field at
+    /// `fields`, may raise, its type or the domain its declaration names
+    /// refusing it.
+    fn may_raise_assignment(
+        &mut self,
+        value: &Evaluation,
+        name: &Name,
+        fields: &[String],
+    ) -> Result<bool, C::Error> {
+        let (stored, raises) = self.assign(value, name, fields)?;
+        if raises {
+            return Ok(true);
+        }
+        let declared = if fields.is_empty() { declared_variable(name) } else { None };
+        match declared.map(|variable| &variable.data_type) {
+            Some(DeclaredType::Data(data_type)) => {
+                self.context.domain_may_refuse(data_type, &stored)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// What the write `write` gives its target, its value read where
@@ -623,6 +665,8 @@ impl<C: Context> Values<C> {
     }
 
     /// Whether `declaration` may raise as its block starts under `state`.
+    /// PL/pgSQL assigns a variable declared without a default a `NULL` of
+    /// unknown type.
     fn may_raise_declaration(
         &mut self,
         declaration: &Declaration,
@@ -631,14 +675,14 @@ impl<C: Context> Values<C> {
         let DeclarationKind::Variable(variable) = &declaration.kind else {
             return Ok(false);
         };
-        let Some(default) = &variable.default else {
-            return Ok(variable.not_null);
-        };
         let Some(name) = self.declared.get(&address(declaration)).cloned() else {
             return Ok(true);
         };
-        let value = self.evaluate_query(default, state)?;
-        Ok(self.assign(&value, &name, &[])?.1)
+        let value = match &variable.default {
+            Some(default) => self.evaluate_query(default, state)?,
+            None => Evaluation::null(ScalarType::Unknown),
+        };
+        self.may_raise_assignment(&value, &name, &[])
     }
 }
 
@@ -771,7 +815,7 @@ impl<'body, C: Context> Domain<'body> for Values<C> {
                             return Ok(true);
                         };
                         let value = self.evaluate_query(&assignment.value, state)?;
-                        Ok(self.assign(&value, &name, &fields)?.1)
+                        self.may_raise_assignment(&value, &name, &fields)
                     }
                     NodeKind::If(choice) => {
                         for branch in &choice.branches {

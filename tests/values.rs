@@ -66,6 +66,7 @@ impl sqlparser_expr_eval::Context for Parameters {
             CalleeKind::Normal,
             INTEGER,
             returns_set,
+            false,
             0,
         );
         Ok(vec![callee])
@@ -448,6 +449,70 @@ impl values::Context for Domains {
 fn an_assignment_to_a_domain_read_as_its_base_type_may_raise() {
     // PostgreSQL answers `raised` for `'abcd'`, longer than `short` allows.
     assert!(assignment_raises("short", Domains));
+}
+
+/// A context reading the domain `nn`, over `int` with `CHECK (VALUE IS NOT
+/// NULL)`, as `int`, and every parameter as `int`.
+struct NotNullDomain;
+
+impl sqlparser_expr_eval::Context for NotNullDomain {
+    type Reference = ();
+    type Error = Infallible;
+
+    fn reference(&mut self, _expression: &Expr) -> Result<Option<Resolved<()>>, Infallible> {
+        Ok(None)
+    }
+
+    fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Infallible> {
+        Ok(Vec::new())
+    }
+
+    fn data_type(&self, data_type: &DataType) -> ScalarType {
+        match data_type {
+            DataType::Custom(name, _) if name.to_string() == "nn" => INTEGER,
+            _ => ScalarType::of(data_type),
+        }
+    }
+}
+
+impl values::Context for NotNullDomain {
+    fn variable(&mut self, _variable: &Name, _fields: &[String]) -> Result<Evaluation, Infallible> {
+        Ok(Evaluation::unknown(INTEGER).with_error(false))
+    }
+
+    fn domain_may_refuse(
+        &mut self,
+        data_type: &DataType,
+        value: &Evaluation,
+    ) -> Result<bool, Infallible> {
+        Ok(matches!(data_type, DataType::Custom(name, _) if name.to_string() == "nn")
+            && value.may_be_null())
+    }
+}
+
+#[test]
+fn a_declaration_without_default_may_raise_where_its_domain_refuses_null() {
+    // PostgreSQL raises `check_violation` for the first as its block starts,
+    // and answers 1 for the others.
+    let bodies = [
+        ("DECLARE w nn; BEGIN RETURN 1; END", true),
+        ("DECLARE w nn := 1; BEGIN RETURN 1; END", false),
+        ("DECLARE w int; BEGIN RETURN 1; END", false),
+    ];
+    for (body, raises) in bodies {
+        let block = embedded_sql(body).unwrap();
+        let analysis = analysis(&block, &[], NotNullDomain);
+        let declared = analysis
+            .escapes()
+            .any(|escape| matches!(escape, Escape::MayRaise(Step::Declaration(_))));
+        assert_eq!(declared, raises, "{body}");
+    }
+}
+
+#[test]
+fn an_assignment_its_domain_may_refuse_raises_into_the_handler() {
+    // PostgreSQL answers `raised` for a NULL `p`, which `nn` refuses.
+    assert!(assignment_raises("nn", NotNullDomain));
 }
 
 /// The outcomes of each of `expressions` where `body` reaches its last
