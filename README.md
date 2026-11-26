@@ -6,7 +6,7 @@
 [![crates.io](https://img.shields.io/crates/v/sqlparser-plpgsql-dataflow.svg)](https://crates.io/crates/sqlparser-plpgsql-dataflow)
 [![docs.rs](https://docs.rs/sqlparser-plpgsql-dataflow/badge.svg)](https://docs.rs/sqlparser-plpgsql-dataflow)
 
-Forward dataflow analysis over the PL/pgSQL bodies [`sqlparser-plpgsql`](https://github.com/connetto-rs/sqlparser-plpgsql) reads. [`walk`] follows a body through its blocks, branches, loops, exception handlers, `EXIT`, `CONTINUE`, `RETURN`, `RAISE` and transaction control, carrying the state a [`Domain`] defines, and answers the state reaching each statement and expression and the states entering and leaving each loop. The crate is `no_std`, needing only `alloc`.
+Forward dataflow analysis over the PL/pgSQL bodies [`sqlparser-plpgsql`](https://github.com/connetto-rs/sqlparser-plpgsql) reads. [`walk`] follows a body through its blocks, branches, loops, exception handlers, `EXIT`, `CONTINUE`, `RETURN`, `RAISE` and transaction control, carrying the state a [`Domain`] defines, and answers the state reaching each statement and expression, the states entering and leaving each loop, and the states the body returns with and an uncaught error leaves it with. The crate is `no_std`, needing only `alloc`.
 
 A domain says what a state is, how paths join, what a write and a test do to a state and where a raise may happen. Loops run until the state at their head stops changing, through the domain's widening. [`reaching::ReachingDefinitions`] is the domain of the writes that may have given each variable its value. [`values::analyze`] walks a body with the guarantees [`sqlparser-expr-eval`](https://github.com/connetto-rs/sqlparser-expr-eval) carries through one expression, so [`values::Analysis::truth_under`] tells what an expression evaluates to given what each variable may hold where the body reaches it. Whatever only a catalog knows, whether a variable holds a row and what a `CALL` writes back, comes through [`Catalog`].
 
@@ -18,7 +18,7 @@ use sqlparser_plpgsql::{
     namespace::{FunctionKind, Name, Signature, Sql},
 };
 use sqlparser_plpgsql_dataflow::{
-    Catalog, Source, Transactions,
+    Catalog, Ending, Source, Transactions,
     reaching::{ReachingDefinitions, Slot},
     walk,
 };
@@ -43,7 +43,7 @@ let signature = Signature {
     kind: FunctionKind::Plain,
 };
 let mut domain = ReachingDefinitions::new();
-let flow = walk(&block, &signature, Transactions::Refused, &mut Scalars, &mut domain)?;
+let flow = walk(&block, &signature, Transactions::Refused, Ending::Raises, &mut Scalars, &mut domain)?;
 
 let NodeKind::Return { value: Some(returned) } = &block.statements[1].kind else {
     unreachable!()

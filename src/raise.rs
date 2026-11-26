@@ -48,12 +48,28 @@ pub(crate) fn reported(raise: &Raise) -> Option<SqlState> {
     Some(code.unwrap_or(pg::RAISE_EXCEPTION))
 }
 
-/// Whether one of `handlers` catches an error reporting `code`.
+/// Whether one of `handlers` surely catches an error reporting `code`,
+/// `None` when only running the step raising it tells.
 ///
 /// A condition catches its own SQLSTATE and, when it names a class, every
 /// SQLSTATE of the class. `others` catches every error but `query_canceled`
-/// and `assert_failure`.
-pub(crate) fn caught(handlers: &[Handler], code: SqlState) -> bool {
+/// and `assert_failure`, so only handlers naming those two beside `others`
+/// surely catch an error whose SQLSTATE is unknown.
+pub(crate) fn caught(handlers: &[Handler], code: Option<SqlState>) -> bool {
+    if let Some(code) = code {
+        return caught_known(handlers, code);
+    }
+    let others = handlers
+        .iter()
+        .flat_map(|handler| &handler.conditions)
+        .any(|condition| matches!(condition, Condition::Others));
+    others
+        && caught_known(handlers, pg::QUERY_CANCELED)
+        && caught_known(handlers, pg::ASSERT_FAILURE)
+}
+
+/// Whether one of `handlers` catches an error reporting `code`.
+fn caught_known(handlers: &[Handler], code: SqlState) -> bool {
     let catches = |condition: SqlState| {
         condition == code || (condition.subclass() == "000" && condition.class() == code.class())
     };
