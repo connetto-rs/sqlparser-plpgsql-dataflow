@@ -3,7 +3,7 @@
 use core::convert::Infallible;
 
 use sqlparser::{
-    ast::{Expr, Function, Query, Statement},
+    ast::{DataType, Expr, Function, Query, Statement},
     dialect::PostgreSqlDialect,
     parser::Parser,
 };
@@ -322,6 +322,82 @@ fn an_assignment_its_target_type_refuses_raises_into_the_handler() {
         let evaluation = analysis.truth_under(value, &parsed(kept)).unwrap();
         assert!(evaluation.expect(body).outcomes().truth, "{body}");
     }
+}
+
+/// The type a context reads a parameter declared `spelled` as.
+fn declared(spelled: &str) -> ScalarType {
+    let mut parser = Parser::new(&PostgreSqlDialect {}).try_with_sql(spelled).unwrap();
+    ScalarType::of(&parser.parse_data_type().unwrap())
+}
+
+/// Whether assigning the parameter `p` to a variable declared `target`
+/// reaches the handler around it, read through `context`.
+fn assignment_raises<C: values::Context<Error = Infallible>>(target: &str, context: C) -> bool {
+    let body = format!(
+        "DECLARE x {target}; BEGIN BEGIN x := p; \
+         EXCEPTION WHEN OTHERS THEN RETURN 'raised'; END; RETURN 'kept'; END"
+    );
+    let block = embedded_sql(&body).unwrap();
+    let analysis = analysis(&block, &["p"], context);
+    let NodeKind::Block(inner) = &block.statements[0].kind else { panic!("a block") };
+    analysis.reached(Sql::Expression(returned(&inner.handlers[0].statements[0])))
+}
+
+#[test]
+fn an_assignment_between_values_of_one_unmodelled_type_never_raises() {
+    // PostgreSQL answers `kept` for each, converting nothing.
+    for type_name in ["uuid", "inet", "jsonb"] {
+        let context = Parameters(vec![declared(type_name)]);
+        assert!(!assignment_raises(type_name, context), "{type_name}");
+    }
+}
+
+#[test]
+fn an_assignment_converting_an_unmodelled_type_may_raise() {
+    // PostgreSQL answers `raised` for `'{}'`, `B'101'` and `'ab'`, refusing
+    // `{}` as a uuid and reading a bare `bit` and `char` as one long.
+    for (parameter, target) in [("jsonb", "uuid"), ("bit", "bit"), ("char", "char")] {
+        let context = Parameters(vec![declared(parameter)]);
+        assert!(assignment_raises(target, context), "{parameter} into {target}");
+    }
+}
+
+/// A context reading the domain `short`, over `varchar(3)`, as its base
+/// type `text`, and every parameter as `text`.
+struct Domains;
+
+impl sqlparser_expr_eval::Context for Domains {
+    type Reference = ();
+    type Error = Infallible;
+
+    fn reference(&mut self, _expression: &Expr) -> Result<Option<Resolved<()>>, Infallible> {
+        Ok(None)
+    }
+
+    fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Infallible> {
+        Ok(Vec::new())
+    }
+
+    fn data_type(&self, data_type: &DataType) -> ScalarType {
+        match data_type {
+            DataType::Custom(name, _) if name.to_string() == "short" => {
+                ScalarType::Text(TextRules::DEFAULT)
+            }
+            _ => ScalarType::of(data_type),
+        }
+    }
+}
+
+impl values::Context for Domains {
+    fn variable(&mut self, _variable: &Name, _fields: &[String]) -> Result<Evaluation, Infallible> {
+        Ok(Evaluation::unknown(ScalarType::Text(TextRules::DEFAULT)).with_error(false))
+    }
+}
+
+#[test]
+fn an_assignment_to_a_domain_read_as_its_base_type_may_raise() {
+    // PostgreSQL answers `raised` for `'abcd'`, longer than `short` allows.
+    assert!(assignment_raises("short", Domains));
 }
 
 /// The outcomes of each of `expressions` where `body` reaches its last
