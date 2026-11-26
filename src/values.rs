@@ -108,22 +108,24 @@ pub trait Context: eval::Context {
         Ok(None)
     }
 
-    /// Whether the constraints of the domain `data_type` names may refuse
-    /// `value`, already of the domain's base type, `NULL` included.
+    /// Whether the constraints of the domain typing `variable`, or its field
+    /// at `fields`, may refuse `value`, already of the domain's base type,
+    /// `NULL` included.
     ///
-    /// PL/pgSQL checks them on each assignment to a variable declared
-    /// `data_type`, and on the `NULL` it assigns a variable declared without
-    /// a default as its block starts. The default reads no type as a domain.
+    /// PL/pgSQL checks them on each assignment to the target, and on the
+    /// `NULL` it assigns a variable declared without a default as its block
+    /// starts. The default reads no type as a domain.
     ///
     /// # Errors
     ///
     /// Returns the context's error when it cannot tell.
     fn domain_may_refuse(
         &mut self,
-        data_type: &DataType,
+        variable: &Name,
+        fields: &[String],
         value: &Evaluation,
     ) -> Result<bool, Self::Error> {
-        let _ = (data_type, value);
+        let _ = (variable, fields, value);
         Ok(false)
     }
 }
@@ -467,8 +469,7 @@ impl<C: Context> Values<C> {
     }
 
     /// Whether assigning `value` to the variable `name`, or its field at
-    /// `fields`, may raise, its type or the domain its declaration names
-    /// refusing it.
+    /// `fields`, may raise, its type or the domain typing it refusing it.
     fn may_raise_assignment(
         &mut self,
         value: &Evaluation,
@@ -479,13 +480,7 @@ impl<C: Context> Values<C> {
         if raises {
             return Ok(true);
         }
-        let declared = if fields.is_empty() { declared_variable(name) } else { None };
-        match declared.map(|variable| &variable.data_type) {
-            Some(DeclaredType::Data(data_type)) => {
-                self.context.domain_may_refuse(data_type, &stored)
-            }
-            _ => Ok(false),
-        }
+        self.context.domain_may_refuse(name, fields, &stored)
     }
 
     /// What the write `write` gives its target, its value read where
