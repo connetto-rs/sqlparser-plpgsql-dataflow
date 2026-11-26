@@ -13,7 +13,7 @@ use sqlparser_expr_eval::{
     sql_values::postgres::{IntegerType, PgValue},
 };
 use sqlparser_plpgsql::{
-    embedded::{Block, Loop, Node, NodeKind, embedded_sql},
+    embedded::{Block, DeclarationKind, DeclaredType, Loop, Node, NodeKind, embedded_sql},
     namespace::{FunctionKind, Name, NameKind, Signature, Sql},
 };
 use sqlparser_plpgsql_dataflow::{
@@ -452,7 +452,9 @@ fn an_assignment_to_a_domain_read_as_its_base_type_may_raise() {
 }
 
 /// A context reading the domain `nn`, over `int` with `CHECK (VALUE IS NOT
-/// NULL)`, as `int`, and every parameter as `int`.
+/// NULL)`, as `int`, typing with it the parameter `p`, a variable declared
+/// `nn` or `t.c%TYPE` and the field `c` of the row `r`, declared
+/// `t%ROWTYPE`, and reading every variable as `int`.
 struct NotNullDomain;
 
 impl sqlparser_expr_eval::Context for NotNullDomain {
@@ -482,30 +484,72 @@ impl values::Context for NotNullDomain {
 
     fn domain_may_refuse(
         &mut self,
-        data_type: &DataType,
+        variable: &Name,
+        fields: &[String],
         value: &Evaluation,
     ) -> Result<bool, Infallible> {
-        Ok(matches!(data_type, DataType::Custom(name, _) if name.to_string() == "nn")
-            && value.may_be_null())
+        let domain = match (variable.kind(), fields) {
+            (NameKind::Parameter { position: 1 }, []) => true,
+            (NameKind::Declared { declaration, .. }, []) => {
+                let DeclarationKind::Variable(declared) = &declaration.kind else {
+                    return Ok(false);
+                };
+                match &declared.data_type {
+                    DeclaredType::Data(DataType::Custom(name, _)) => name.to_string() == "nn",
+                    DeclaredType::ColumnType { of, .. } => of.to_string() == "t.c",
+                    _ => false,
+                }
+            }
+            (_, [field]) => field == "c",
+            _ => false,
+        };
+        Ok(domain && value.may_be_null())
     }
+}
+
+/// Whether a step of `body` that `step` picks may raise where a path
+/// reaches it, `body` being a function with the parameter `p` read through
+/// [`NotNullDomain`].
+fn may_raise_under_not_null_domain(body: &str, step: fn(&Step<'_>) -> bool) -> bool {
+    let block = embedded_sql(body).unwrap();
+    let analysis = analysis(&block, &["p"], NotNullDomain);
+    analysis.escapes().any(|escape| matches!(escape, Escape::MayRaise(raising) if step(&raising)))
 }
 
 #[test]
 fn a_declaration_without_default_may_raise_where_its_domain_refuses_null() {
-    // PostgreSQL raises `check_violation` for the first as its block starts,
-    // and answers 1 for the others.
+    // PostgreSQL raises `check_violation` for the first two as their block
+    // starts, and answers 1 for the others.
     let bodies = [
         ("DECLARE w nn; BEGIN RETURN 1; END", true),
+        ("DECLARE w t.c%TYPE; BEGIN RETURN 1; END", true),
         ("DECLARE w nn := 1; BEGIN RETURN 1; END", false),
         ("DECLARE w int; BEGIN RETURN 1; END", false),
+        ("DECLARE r t%ROWTYPE; BEGIN RETURN 1; END", false),
     ];
     for (body, raises) in bodies {
-        let block = embedded_sql(body).unwrap();
-        let analysis = analysis(&block, &[], NotNullDomain);
-        let declared = analysis
-            .escapes()
-            .any(|escape| matches!(escape, Escape::MayRaise(Step::Declaration(_))));
+        let declared =
+            may_raise_under_not_null_domain(body, |step| matches!(step, Step::Declaration(_)));
         assert_eq!(declared, raises, "{body}");
+    }
+}
+
+#[test]
+fn an_assignment_to_any_target_its_domain_may_refuse_may_raise() {
+    // PostgreSQL raises `check_violation` at the assignment for each `NULL`,
+    // and answers 1 for the others.
+    let bodies = [
+        ("BEGIN p := NULL; RETURN 1; END", true),
+        ("BEGIN p := 1; RETURN 1; END", false),
+        ("DECLARE w t.c%TYPE := 1; BEGIN w := NULL; RETURN 1; END", true),
+        ("DECLARE r t%ROWTYPE; BEGIN r.c := NULL; RETURN 1; END", true),
+        ("DECLARE r t%ROWTYPE; BEGIN r.c := 1; RETURN 1; END", false),
+    ];
+    for (body, raises) in bodies {
+        let assigned = may_raise_under_not_null_domain(body, |step| {
+            matches!(step, Step::Node(Node { kind: NodeKind::Assignment(_), .. }))
+        });
+        assert_eq!(assigned, raises, "{body}");
     }
 }
 
