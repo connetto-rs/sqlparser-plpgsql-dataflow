@@ -180,6 +180,55 @@ fn a_default_decides_a_later_condition() {
     assert!(!analysis.reached(Sql::Expression(returned(&choice.otherwise[0]))));
 }
 
+/// A context knowing the integer each expression written as a key of its
+/// map evaluates to, and nothing else.
+struct Known(&'static [(&'static str, i64)]);
+
+impl sqlparser_expr_eval::Context for Known {
+    type Reference = ();
+    type Error = Infallible;
+
+    fn reference(&mut self, _expression: &Expr) -> Result<Option<Resolved<()>>, Infallible> {
+        Ok(None)
+    }
+
+    fn callees(&mut self, _call: &Function) -> Result<Vec<Callee>, Infallible> {
+        Ok(Vec::new())
+    }
+
+    fn expression(&mut self, expression: &Expr) -> Result<Option<Evaluation>, Infallible> {
+        let text = expression.to_string();
+        Ok(self
+            .0
+            .iter()
+            .find(|(known, _)| *known == text)
+            .map(|(_, value)| Evaluation::known(PgValue::Integer(*value), INTEGER)))
+    }
+}
+
+impl values::Context for Known {}
+
+#[test]
+fn the_context_answers_a_whole_expression_reading_no_variable() {
+    // PostgreSQL answers `big` from the first where `limit_of()` returns 3,
+    // and `small` from the second.
+    let block = embedded_sql(
+        "DECLARE x int; BEGIN x := limit_of(); IF x > 2 THEN RETURN 'big'; END IF; \
+         IF x + 1 > 5 THEN RETURN 'unreached'; END IF; RETURN 'small'; END",
+    )
+    .unwrap();
+    let mut known = analysis(&block, &[], Known(&[("limit_of()", 3)]));
+    assert_eq!(outcomes(&mut known, if_condition(&block.statements[1])), Outcomes::TRUE);
+    assert!(!known.reached(Sql::Expression(if_condition(&block.statements[2]))));
+    let block = embedded_sql(
+        "DECLARE x int := 1; BEGIN IF x + 1 > 5 THEN RETURN 'big'; END IF; RETURN 'small'; END",
+    )
+    .unwrap();
+    // `x + 1` reads the variable `x`, which the context knows nothing of.
+    let mut ignored = analysis(&block, &[], Known(&[("x + 1", 10)]));
+    assert_eq!(outcomes(&mut ignored, if_condition(&block.statements[0])), Outcomes::FALSE);
+}
+
 #[test]
 fn a_branch_narrows_the_conditions_inside_it() {
     // PostgreSQL answers `null` for `NULL` and `other` for 5.
