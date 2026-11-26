@@ -67,6 +67,7 @@ impl sqlparser_expr_eval::Context for Parameters {
             INTEGER,
             returns_set,
             false,
+            false,
             0,
         );
         Ok(vec![callee])
@@ -454,7 +455,8 @@ fn an_assignment_to_a_domain_read_as_its_base_type_may_raise() {
 /// A context reading the domain `nn`, over `int` with `CHECK (VALUE IS NOT
 /// NULL)`, as `int`, typing with it the parameter `p`, a variable declared
 /// `nn` or `t.c%TYPE` and the field `c` of the row `r`, declared
-/// `t%ROWTYPE`, and reading every variable as `int`.
+/// `t%ROWTYPE`, checking a cast to `nn` against its constraint, and reading
+/// every variable as `int`.
 struct NotNullDomain;
 
 impl sqlparser_expr_eval::Context for NotNullDomain {
@@ -474,6 +476,19 @@ impl sqlparser_expr_eval::Context for NotNullDomain {
             DataType::Custom(name, _) if name.to_string() == "nn" => INTEGER,
             _ => ScalarType::of(data_type),
         }
+    }
+
+    fn cast_checks(&mut self, data_type: &DataType) -> Result<bool, Infallible> {
+        Ok(matches!(data_type, DataType::Custom(name, _) if name.to_string() == "nn"))
+    }
+
+    fn checked_cast(
+        &mut self,
+        _data_type: &DataType,
+        converted: Evaluation,
+    ) -> Result<Evaluation, Infallible> {
+        let refused = converted.may_be_null();
+        Ok(converted.with_error(refused))
     }
 }
 
@@ -544,6 +559,23 @@ fn an_assignment_to_any_target_its_domain_may_refuse_may_raise() {
         ("DECLARE w t.c%TYPE := 1; BEGIN w := NULL; RETURN 1; END", true),
         ("DECLARE r t%ROWTYPE; BEGIN r.c := NULL; RETURN 1; END", true),
         ("DECLARE r t%ROWTYPE; BEGIN r.c := 1; RETURN 1; END", false),
+    ];
+    for (body, raises) in bodies {
+        let assigned = may_raise_under_not_null_domain(body, |step| {
+            matches!(step, Step::Node(Node { kind: NodeKind::Assignment(_), .. }))
+        });
+        assert_eq!(assigned, raises, "{body}");
+    }
+}
+
+#[test]
+fn a_cast_its_domain_may_refuse_may_raise() {
+    // PostgreSQL raises `check_violation` at the assignment for each `NULL`
+    // cast to `nn`, and answers 1 for the other.
+    let bodies = [
+        ("DECLARE w int; BEGIN w := NULL::nn; RETURN 1; END", true),
+        ("DECLARE w text; BEGIN w := (NULL::nn)::text; RETURN 1; END", true),
+        ("DECLARE w int; BEGIN w := 1::nn; RETURN 1; END", false),
     ];
     for (body, raises) in bodies {
         let assigned = may_raise_under_not_null_domain(body, |step| {

@@ -939,6 +939,18 @@ impl<C: Context> eval::Context for Scope<'_, C> {
         self.context.data_type(data_type)
     }
 
+    fn cast_checks(&mut self, data_type: &DataType) -> Result<bool, C::Error> {
+        self.context.cast_checks(data_type)
+    }
+
+    fn checked_cast(
+        &mut self,
+        data_type: &DataType,
+        converted: Evaluation,
+    ) -> Result<Evaluation, C::Error> {
+        self.context.checked_cast(data_type, converted)
+    }
+
     fn collation(&mut self, name: &ObjectName) -> Result<TextRules, C::Error> {
         self.context.collation(name)
     }
