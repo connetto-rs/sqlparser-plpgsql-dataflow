@@ -862,6 +862,24 @@ impl<C: Context> eval::Context for Scope<'_, C> {
         self.context.evaluate_body(callee, arguments)
     }
 
+    /// The user's context answers only an expression reading no name a
+    /// variable of the body answers, since it knows no variable.
+    fn expression(&mut self, expression: &Expr) -> Result<Option<Evaluation>, C::Error> {
+        let names = self.names;
+        let reads_variable = visit_expressions(expression, |inner| {
+            match parts(inner) {
+                Some(parts) if names.iter().flatten().any(|names| names.contains_key(&parts)) => {
+                    ControlFlow::Break(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        });
+        if reads_variable.is_break() {
+            return Ok(None);
+        }
+        self.context.expression(expression)
+    }
+
     fn query(
         &mut self,
         query: &Query,
