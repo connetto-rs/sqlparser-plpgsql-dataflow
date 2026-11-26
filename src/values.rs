@@ -19,7 +19,7 @@ use sqlparser::{
     dialect::PostgreSqlDialect,
 };
 use sqlparser_expr_eval::{
-    self as eval, Callee, CalleeKind, Evaluation, Guarantees, Interval, Outcomes,
+    self as eval, Callee, CalleeKind, Evaluation, Guarantees, Interval, OtherType, Outcomes,
     PostgreSqlOptions, QueryEvaluation, Resolved, ScalarType, Subject, TextRules, Unlisted,
     evaluate, implied, sql_values::postgres as pg,
 };
@@ -435,16 +435,10 @@ impl<C: Context> Values<C> {
         let unmodified = match (name.kind(), declared) {
             (NameKind::Parameter { .. }, _) => fields.is_empty(),
             (_, Some(variable)) => {
-                matches!(
-                    &variable.data_type,
-                    DeclaredType::Data(
-                        DataType::Text
-                            | DataType::Varchar(None)
-                            | DataType::CharacterVarying(None)
-                            | DataType::Numeric(ExactNumberInfo::None)
-                            | DataType::Decimal(ExactNumberInfo::None)
-                    )
-                )
+                match &variable.data_type {
+                    DeclaredType::Data(data_type) => modifier_free(data_type, base.ty()),
+                    DeclaredType::ColumnType { .. } | DeclaredType::RowType { .. } => false,
+                }
             }
             (_, None) => false,
         };
@@ -998,7 +992,9 @@ fn base<C: Context>(
                         DeclaredType::ColumnType { .. } | DeclaredType::RowType { .. } => None,
                     }
                 }
-                DeclarationKind::Cursor(_) => own(ScalarType::Other),
+                DeclarationKind::Cursor(_) => {
+                    own(ScalarType::Other(Some(OtherType::catalog("refcursor"))))
+                }
                 DeclarationKind::Alias(_) => None,
             }
         }
@@ -1064,6 +1060,42 @@ fn keeps(source: &ScalarType, target: &ScalarType, unmodified: bool) -> bool {
         (ScalarType::Integer(_) | ScalarType::Numeric, ScalarType::Numeric)
         | (ScalarType::Text(_) | ScalarType::UnknownLiteral, ScalarType::Text(_)) => unmodified,
         (ScalarType::Enum(left), ScalarType::Enum(right)) => left == right,
+        (ScalarType::Other(Some(left)), ScalarType::Other(Some(right))) => {
+            left == right && unmodified
+        }
+        _ => false,
+    }
+}
+
+/// Whether a variable declared `data_type`, whose values the context types
+/// `scalar`, carries no length, precision or scale. PostgreSQL reads a bare
+/// `char` as `char(1)` and a bare `bit` as `bit(1)`, so neither counts. A
+/// custom name counts only where the context types it as an unmodelled type
+/// it names, since it may spell a domain whose base type, carrying a length,
+/// the context reads it as.
+fn modifier_free(data_type: &DataType, scalar: &ScalarType) -> bool {
+    match data_type {
+        DataType::Text
+        | DataType::Varchar(None)
+        | DataType::CharacterVarying(None)
+        | DataType::Numeric(ExactNumberInfo::None)
+        | DataType::Decimal(ExactNumberInfo::None)
+        | DataType::Uuid
+        | DataType::JSON
+        | DataType::JSONB
+        | DataType::Bytea
+        | DataType::Regclass
+        | DataType::TsVector
+        | DataType::TsQuery
+        | DataType::GeometricType(_)
+        | DataType::Time(None, _)
+        | DataType::Timestamp(None, _)
+        | DataType::Interval { fields: None, precision: None }
+        | DataType::BitVarying(None)
+        | DataType::VarBit(None) => true,
+        DataType::Custom(_, modifiers) => {
+            modifiers.is_empty() && matches!(scalar, ScalarType::Other(Some(_)))
+        }
         _ => false,
     }
 }
